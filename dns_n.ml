@@ -1,4 +1,4 @@
-(*
+0(*
 A Domain Name client library.
 This code is placed in the Public Domain.
 
@@ -200,41 +200,41 @@ type rr_type = [
 type q_type = [ rr_type | `AXFR | `MAILB | `MAILA | `ANY ]
 
 let int_of_rr_type : rr_type -> int = function
-| `A     ->  1
-| `NS    ->  2
-| `MD    ->  3
-| `MF    ->  4
-| `CNAME ->  5
-| `SOA   ->  6
-| `MB    ->  7
-| `MG    ->  8
-| `MR    ->  9
-| `NULL  -> 10
-| `WKS   -> 11
-| `PTR   -> 12
-| `HINFO -> 13
-| `MINFO -> 14
-| `MX    -> 15
-| `TXT   -> 16
+  | `A     ->  1
+  | `NS    ->  2
+  | `MD    ->  3
+  | `MF    ->  4
+  | `CNAME ->  5
+  | `SOA   ->  6
+  | `MB    ->  7
+  | `MG    ->  8
+  | `MR    ->  9
+  | `NULL  -> 10
+  | `WKS   -> 11
+  | `PTR   -> 12
+  | `HINFO -> 13
+  | `MINFO -> 14
+  | `MX    -> 15
+  | `TXT   -> 16
 
 and rr_type_of_int : int -> rr_type = function
-|  1     -> `A
-|  2     -> `NS
-|  3     -> `MD
-|  4     -> `MF
-|  5     -> `CNAME
-|  6     -> `SOA
-|  7     -> `MB
-|  8     -> `MG
-|  9     -> `MR
-| 10     -> `NULL
-| 11     -> `WKS
-| 12     -> `PTR
-| 13     -> `HINFO
-| 14     -> `MINFO
-| 15     -> `MX
-| 16     -> `TXT
-| _      -> invalid_arg "rr_type_of_int"
+  |  1     -> `A
+  |  2     -> `NS
+  |  3     -> `MD
+  |  4     -> `MF
+  |  5     -> `CNAME
+  |  6     -> `SOA
+  |  7     -> `MB
+  |  8     -> `MG
+  |  9     -> `MR
+  | 10     -> `NULL
+  | 11     -> `WKS
+  | 12     -> `PTR
+  | 13     -> `HINFO
+  | 14     -> `MINFO
+  | 15     -> `MX
+  | 16     -> `TXT
+  | _      -> invalid_arg "rr_type_of_int"
 
 let int_of_q_type : q_type -> int = function
 | `AXFR         -> 252
@@ -482,6 +482,40 @@ let query_dns addr q =
 let mail_servers server domain =
   let res = query_dns server (query ~q_type:`MX 0 domain) in
   (List.sort (fun (p, _) (p', _) -> compare p p')
-  (List.map (function { rr_rdata = `Exchange (p, d); _ } -> (p, d))
+     (List.map (function { rr_rdata = `Exchange (p, d); _ } -> (p, d))
   (List.filter (fun { rr_type; _ } -> rr_type = `MX)
   res.answer)))
+
+let rd () = 
+
+  (*** construct a dns response fragment
+       let server, domain = "128.243.98.2", "google.com." in
+       
+       let d = query_dns server (query ~q_type:`A 0 domain) in
+       let bs = Writer.run (write_dns_record d) in
+       let oc = open_out "dns.out" in
+       output_string oc bs; close_out oc
+  *)
+
+  let contents ic = (* from http://ocaml.tuxfamily.org/Reading_a_file *)
+    let buf = Buffer.create 16384
+    and tmp = String.create 4096 in
+    let rec aux() =
+      let bytes = input ic tmp 0 4096 in
+      if bytes > 0 then begin
+        Buffer.add_substring buf tmp 0 bytes;
+        aux()
+      end
+    in
+    (try aux() with End_of_file -> ());
+    (Buffer.contents buf)
+  in
+  
+  let ic = open_in "dns.2.dat" in
+  let ds = contents ic in
+  let p = Parser.run in
+  (match p parse_dns_record ds with
+    | Some r -> print_endline "some"
+    | None -> print_endline "none"
+  );
+  close_in ic

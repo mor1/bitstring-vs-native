@@ -1,0 +1,5 @@
+<*/**.ml>: annot
+                
+"dns_n.native": use_unix, use_str
+"dns.native": use_unix, use_str
+"dns_bs.native": use_bitstring, package_bitstring
