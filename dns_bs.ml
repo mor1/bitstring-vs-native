@@ -202,7 +202,7 @@ let detail_to_string d =
     (if d.ra then "can-recurse" else "no-recurse")
     (int_of_byte d.z) (int_of_byte d.rcode)
                
-type dns_record = {
+type dns_packet = {
   id          : int16;
   detail      : detail;
   questions   : question list;
@@ -459,6 +459,13 @@ let parse_pcap e bits =
     | { _ } -> raise (Unparsable ("parse_pcap", bits))
 let pcap_to_string p = 
   sp "%ld.%06ld [%ld/%ld]" p.ts_secs p.ts_usecs p.caplen p.pktlen
+
+type packet = [
+| PCAP of pcap * packet
+| ETH of eth * packet
+| IPv4 of ipv4 * packet
+| UDP of udp * packet
+| DNS of dns_packet
 
 type pcap_file = {
   magic: int32;
