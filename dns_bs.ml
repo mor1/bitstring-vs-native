@@ -15,15 +15,26 @@
  *)
 
 open Bitstring
+let sp = Printf.sprintf
+let pr = Printf.printf
+let ep = Printf.eprintf
 
 exception Unparsable of string * bitstring
 
 let (|>) x f = f x
 let (>>) f g x = g (f x)
 let (||>) l f = List.map f l
+
+let (&&&) x y = x land y
+let (|||) x y = x lor y
+let (^^^) x y = x lxor y
+let (<<<) x y = x lsl y
+let (>>>) x y = x lsr y
+
 let join c l = List.fold_left (fun x y -> y ^ c ^ x) "" l
 let stop (x, bits) = x
 
+type int8 = int
 type int16 = int
 type byte = char
 let byte (i:int) : char = Char.chr i
@@ -182,7 +193,7 @@ type detail = {
   rcode: byte;  
 }
 let detail_to_string d = 
-  Printf.sprintf "%c:%02x %s:%s:%s:%s %02x %d"
+  sp "%c:%02x %s:%s:%s:%s %02x %d"
     (if d.qr then 'R' else 'Q')
     (int_of_byte d.opcode)
     (if d.aa then "auth" else "non-auth")
@@ -235,7 +246,7 @@ let parse_resource t bits =
     | `TXT -> let names, _ = 
                 let rec aux ns bits = 
                   let n, bits = parse_name bits in
-                  Printf.printf "!!! %d\n" (bits |> bitstring_length);
+                  pr "!!! %d\n" (bits |> bitstring_length);
                   aux (n :: ns) bits
                 in
                 aux [] bits
@@ -256,19 +267,18 @@ let parse_resource t bits =
     )
 let string_of_resource r = 
   match r with
-    | `Hostinfo (cpu, os) -> Printf.sprintf "Hostinfo (%s, %s)" cpu os
-    | `Domain n -> Printf.sprintf "Domain (%s)" n
-    | `Mailbox (rn, mn) -> Printf.sprintf "Mailbox (%s, %s)" rn mn
-    | `Exchange (i, n) -> Printf.sprintf "Exchange (%d, %s)" i n
-    | `Data d -> Printf.sprintf "Data (%s)" d
-    | `Text ns -> Printf.sprintf "Text (%s)" (ns |> join "|")
+    | `Hostinfo (cpu, os) -> sp "Hostinfo (%s, %s)" cpu os
+    | `Domain n -> sp "Domain (%s)" n
+    | `Mailbox (rn, mn) -> sp "Mailbox (%s, %s)" rn mn
+    | `Exchange (i, n) -> sp "Exchange (%d, %s)" i n
+    | `Data d -> sp "Data (%s)" d
+    | `Text ns -> sp "Text (%s)" (ns |> join "|")
     | `Authority (mn, rn, serial, refresh, retry, expire, min) 
-      -> (Printf.sprintf "Authority (%s, %s, %d,%d,%d,%d,%d)" 
-            mn rn (Int32.to_int serial) (Int32.to_int refresh)
-            (Int32.to_int retry) (Int32.to_int expire) (Int32.to_int min))
-    | `Address a -> Printf.sprintf "Address (%s)" (Unix.string_of_inet_addr a)
+      -> (sp "Authority (%s, %s, %ld,%ld,%ld,%ld,%ld)" 
+            mn rn serial refresh retry expire min)
+    | `Address a -> sp "Address (%s)" (Unix.string_of_inet_addr a)
     | `Services (a, p, bm) 
-      -> (Printf.sprintf "Services (%s, %d, %s)"
+      -> (sp "Services (%s, %d, %s)"
             (Unix.string_of_inet_addr a) (int_of_byte p) bm)
       
 let parse_question bits = 
@@ -282,7 +292,7 @@ let parse_question bits =
     | { _ } -> raise (Unparsable ("parse_question", bits))
 
 let question_to_string q = 
-  Printf.sprintf "%s <%s|%s>" 
+  sp "%s <%s|%s>" 
     q.q_name (string_of_q_type q.q_type) (string_of_q_class q.q_class)
                                                          
 let parse_rr bits =
@@ -300,9 +310,9 @@ let parse_rr bits =
     | { _ } -> raise (Unparsable ("parse_rr", bits))
                                                         
 let rr_to_string rr = 
-  Printf.sprintf "%s <%s|%s|%s> %s" 
-    rr.rr_name (string_of_rr_type rr.rr_type) 
-    (string_of_rr_class rr.rr_class) (Int32.to_string rr.rr_ttl)
+  sp "%s <%s|%s|%ld> %s" 
+    rr.rr_name 
+    (string_of_rr_type rr.rr_type) (string_of_rr_class rr.rr_class) rr.rr_ttl
     (string_of_resource rr.rr_rdata)
 
 let parsen pf n bits = 
@@ -339,21 +349,189 @@ let parse_dns bits =
 
     | { _ } -> raise (Unparsable ("parse_dns", bits))
 
-let _ = 
+type ip_flags = {
+  df: bool;
+  mf: bool;
+}
+
+let parse_flags b = 
+  { df = (b &&& 0b0_010) != 0;
+    mf = (b &&& 0b0_001) != 0;
+  }
+
+type ip_option = [
+| `NOP
+| `Security of bytes
+| `LooseSR of int * bytes
+| `StrictSR of int * bytes
+| `RecordR of int * bytes
+| `StreamID of int32
+(* | `Timestamp*) 
+]  
+let parse_options bits = 
+  let rec aux os bits = 
+    bitmatch bits with
+      | { 0: 8 } -> os
+      | { 1: 8 } -> aux (`NOP :: os) bits
+      | { 130: 8; len: 8: check(len == 11*8) ; data: len: string } 
+        -> aux (`Security data :: os) bits
+      | { 131: 8; len: 8; ptr: 8; route: (len-3)*8: string }
+        -> aux (`LooseSR (ptr, route) :: os) bits
+      | { 137: 8; len: 8; ptr: 8; route: (len-3)*8: string }
+        -> aux (`StrictSR (ptr, route) :: os) bits
+      | { 7: 8; len: 8; ptr: 8; route: (len-3)*8: string }
+        -> aux (`RecordR (ptr, route) :: os) bits
+      | { 136: 8; 4: 8; streamid: 32 }
+        -> aux (`StreamID streamid :: os) bits
+      | { _ } -> raise (Unparsable ("parse_options", bits))
+  in
+  aux [] bits
+          
+type ipv4 = {
+  version: int;
+  hdrlen: int;
+  tos: byte;
+  length: int16;
+  ident: int16;
+  flags: ip_flags;
+  offset: int;
+  ttl: int8;
+  proto: int8;
+  cksum: int16;
+  saddr: Unix.inet_addr;
+  daddr: Unix.inet_addr;
+  options: ip_option list;
+}
+
+let parse_ipv4 bits = 
+  bitmatch bits with
+  | { version: 4; hdrlen: 4; tos: 8; length: 16;
+      ident: 16; flags: 3; offset: 13;
+      ttl: 8; proto: 8; cksum: 16;
+      source: 32; dest: 32;
+      options: (hdrlen-5)*32: bitstring;
+      bits: -1: bitstring 
+    } when version = 4 
+      -> { version = version; hdrlen = hdrlen; tos = byte tos; length = length;
+           ident = ident; flags = parse_flags flags; offset = offset;
+           ttl = ttl; proto = proto; cksum = cksum;
+           saddr = source |> Obj.magic;
+           daddr = dest |> Obj.magic;
+           options = parse_options options;
+         }, bits
+  | { _ } -> raise (Unparsable ("parse_ipv4", bits))
+                                                    
+type udp = {
+  sport: int16;
+  dport: int16;
+  length: int16;
+  cksum: int16;
+}
+let parse_udp bits = 
+  bitmatch bits with
+    | { sport: 16; dport: 16; length: 16; cksum: 16; bits: -1: bitstring }
+      -> { sport = sport; dport = dport; 
+           length = length; cksum = cksum;
+         }, bits
+    | { _ } -> raise (Unparsable ("parse_udp", bits))
+
+type pcap = {
+  ts_secs: int32;
+  ts_usecs: int32;
+  caplen: int32;
+  pktlen: int32;
+  pkt: bitstring;                
+}
+let parse_pcap e bits = 
+  bitmatch bits with
+    | { ts_secs: 32: endian (e);
+        ts_usecs: 32: endian (e);
+        caplen: 32: endian (e);
+        pktlen: 32: endian (e);
+        pkt: (Int32.to_int caplen*8): bitstring;
+        bits: -1: bitstring
+      }
+      -> { ts_secs = ts_secs; ts_usecs = ts_usecs;
+           caplen = caplen; pktlen = pktlen; 
+           pkt = pkt;
+         }, bits        
+
+    | { _ } -> raise (Unparsable ("parse_pcap", bits))
+let pcap_to_string p = 
+  sp "%ld.%06ld [%ld/%ld]" p.ts_secs p.ts_usecs p.caplen p.pktlen
+
+type pcap_file = {
+  magic: int32;
+  major: int16; minor: int16;
+  tzone: int32;
+  snaplen: int32;
+  linktype: int32;
+}
+let pcap_file_to_string pf =
+  sp "(%08lx) %d.%d tzone:%ld snaplen:%ld linktype:%ld"
+    pf.magic pf.major pf.minor pf.tzone pf.snaplen pf.linktype
+                                                              
+let magic_le = 0x0_d4c3b2a1_l
+and magic_be = 0x0_a1b2c3d4_l
+and endian_of = function
+  | 0x0_d4c3b2a1_l -> Bitstring.LittleEndian
+  | 0x0_a1b2c3d4_l -> Bitstring.BigEndian
+  | _ -> assert false
+                                            
+let parse_pcap_file bits = 
+  bitmatch bits with
+    | { ((0x0_d4c3b2a1_l|0x0_a1b2c3d4_l) as magic): 32;
+        major: 16: endian (endian_of magic);
+        minor: 16: endian (endian_of magic);
+        tzone: 32: endian (endian_of magic);
+        _: 32;
+        snaplen: 32: endian (endian_of magic);
+        linktype: 32: endian (endian_of magic);
+        bits: -1: bitstring
+      }
+      -> { magic = magic;
+           major = major; minor = minor;
+           tzone = tzone;
+           snaplen = snaplen;
+           linktype = linktype;
+         }, bits        
+
+let main_dns_direct () = 
   let fn = "dns.dat" in
-  let bits = Bitstring.bitstring_of_file fn in
+  let bits = bitstring_of_file fn in
   try
     let dns = parse_dns bits in
-    Printf.printf "id:%04x detail:%s\n" dns.id (detail_to_string dns.detail);
-    Printf.printf "qds: %s\n" 
+    pr "id:%04x detail:%s\n" dns.id (detail_to_string dns.detail);
+    pr "qds: %s\n" 
       (dns.questions ||> question_to_string |> join "\n\t");
-    Printf.printf "ans: %s\n" 
+    pr "ans: %s\n" 
       (dns.answers ||> rr_to_string |> join "\n\t");
-    Printf.printf "nss: %s\n" 
+    pr "nss: %s\n" 
       (dns.authorities ||> rr_to_string |> join "\n\t");
-    Printf.printf "ars: %s\n" 
+    pr "ars: %s\n" 
       (dns.additionals ||> rr_to_string |> join "\n\t")
   with
       Unparsable (where, what) ->
-        Printf.printf "EXC: %s\n" where;
+        pr "EXC: %s\n" where;
         hexdump_bitstring stdout what
+
+let main_pcap () = 
+  let fn = "test.pcap" in
+  let bits = bitstring_of_file fn in
+  try
+    let h, ps = parse_pcap_file bits in
+    pr "PCAP FILE: %s\n" (pcap_file_to_string h);
+    let rec aux e i bits = 
+      if bitstring_length bits != 0 then
+        let p, bits = parse_pcap e bits in
+        pr "%d: %s\n" i (pcap_to_string p);
+        aux e (i+1) bits
+    in aux (endian_of h.magic) 0 ps
+  with
+      Unparsable (where, what) ->
+        ep "EXC: %s\n" where;
+        hexdump_bitstring stdout what
+
+let _ = main_dns_direct ()
+let _ = main_pcap ()
+
