@@ -1,31 +1,38 @@
 (*
-A Domain Name client library.
-This code is placed in the Public Domain.
-
-References:
-ftp://ftp.rfc-editor.org/in-notes/rfc1035.txt
-http://pleac.sourceforge.net/pleac_ocaml/sockets.html
-http://www.brool.com/index.php/ocaml-sockets
-http://www.zenskg.net/mdns_article/mdns_article.html
-*)
+ * Copyright (c) 2011 Richard Mortier <mort@cantab.net>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *)
 
 open Bitstring
 
 exception Unparsable of string * bitstring
 
-let (|>) x y = y x
+let (|>) x f = f x
 let (>>) f g x = g (f x)
 let (||>) l f = List.map f l
 let join c l = List.fold_left (fun x y -> y ^ c ^ x) "" l
+let stop (x, bits) = x
 
-type int16  = int
-type byte   = char
+type int16 = int
+type byte = char
 let byte (i:int) : char = Char.chr i
+let int_of_byte b = Char.code b
 
-type bytes  = bitstring
-  
-type label        = string
-type domain_name  = string
+type bytes = string
+type label = string
+type domain_name = string
+let string o = match o with | Some x -> x | None -> ""
 
 type rr_type = [
 | `A | `NS | `MD | `MF | `CNAME | `SOA | `MB | `MG
@@ -140,16 +147,14 @@ and q_class_of_int : int -> q_class = function
 
 type resource = [
 | `Hostinfo  of string * string
-(*
 | `Domain    of domain_name
 | `Mailbox   of domain_name * domain_name
 | `Exchange  of int * domain_name
 | `Data      of bytes
-| `Text      of bytes list
+| `Text      of string list
 | `Authority of domain_name * domain_name * int32 * int32 * int32 * int32 * int32
 | `Address   of Unix.inet_addr
-*)
-| `Services  of int32 * byte * bytes
+| `Services  of Unix.inet_addr * byte * bytes
 ]
 
 type rsrc_record = {
@@ -166,9 +171,29 @@ type question = {
   q_class : q_class;
 }
 
+type detail = {
+  qr: bool; 
+  opcode: byte;
+  aa: bool; 
+  tc: bool; 
+  rd: bool; 
+  ra: bool;
+  z: byte;
+  rcode: byte;  
+}
+let detail_to_string d = 
+  Printf.sprintf "%c:%02x %s:%s:%s:%s %02x %d"
+    (if d.qr then 'R' else 'Q')
+    (int_of_byte d.opcode)
+    (if d.aa then "auth" else "non-auth")
+    (if d.tc then "trunc" else "complete")
+    (if d.rd then "recurse" else "non-rec")
+    (if d.ra then "can-recurse" else "no-recurse")
+    (int_of_byte d.z) (int_of_byte d.rcode)
+               
 type dns_record = {
   id          : int16;
-  detail      : int16;
+  detail      : detail;
   questions   : question list;
   answers     : rsrc_record list;
   authorities : rsrc_record list;
@@ -192,23 +217,60 @@ let parse_name bits =
   let name, bits = aux [] bits in
   (join "." name, bits)
 
-let string o = match o with | Some x -> x | None -> ""
-let parse_resource rr_type rr_rdata = function
-  | `HINFO -> let (cpu, rdata) = parse_label rr_rdata in
-              let (os, _) = parse_label rdata in
-              `Hostinfo (string cpu, string os)
-(*
-  | `MB | `MD | `MF | `MG | `MR | `NS
-  | `CNAME | `PTR
-  | `MINFO
-  | `MX
-  | `NULL
-  | `TXT
-  | `SOA
-  | `A
-*)
-  | `WKS -> `Services (Int32.zero, byte 0, "")
-
+let parse_resource t bits = 
+  match t with
+    | `HINFO -> let (cpu, bits) = parse_label bits in
+                let os = bits |> parse_label |> stop in
+                `Hostinfo (string cpu, string os)
+    | `MB | `MD | `MF | `MG | `MR | `NS
+    | `CNAME | `PTR -> `Domain (bits |> parse_name |> stop)
+    | `MINFO -> let (rm, bits) = parse_name bits in
+                let em = bits |> parse_name |> stop in
+                `Mailbox (rm, em)
+    | `MX -> (bitmatch bits with
+        | { preference: 16; bits: -1: bitstring } 
+          -> `Exchange (preference, bits |> parse_name |> stop)
+    )
+    | `NULL -> `Data (string_of_bitstring bits)    
+    | `TXT -> let names, _ = 
+                let rec aux ns bits = 
+                  let n, bits = parse_name bits in
+                  Printf.printf "!!! %d\n" (bits |> bitstring_length);
+                  aux (n :: ns) bits
+                in
+                aux [] bits
+              in
+              `Text names
+    | `SOA -> let mn, bits = parse_name bits in
+              let rn, bits = parse_name bits in 
+              (bitmatch bits with
+                | { serial: 32; refresh: 32; retry: 32; expire: 32;
+                    minimum: 32 }
+                  -> `Authority (mn, rn, 
+                                 serial, refresh, retry, expire, minimum)
+              )
+    | `A -> `Address (bits |> string_of_bitstring |> Obj.magic)
+    | `WKS -> (bitmatch bits with
+        | { addr: 32; proto: 8; bitmap: -1: string } 
+          -> `Services (addr |> Obj.magic, proto |> byte, bitmap)
+    )
+let string_of_resource r = 
+  match r with
+    | `Hostinfo (cpu, os) -> Printf.sprintf "Hostinfo (%s, %s)" cpu os
+    | `Domain n -> Printf.sprintf "Domain (%s)" n
+    | `Mailbox (rn, mn) -> Printf.sprintf "Mailbox (%s, %s)" rn mn
+    | `Exchange (i, n) -> Printf.sprintf "Exchange (%d, %s)" i n
+    | `Data d -> Printf.sprintf "Data (%s)" d
+    | `Text ns -> Printf.sprintf "Text (%s)" (ns |> join "|")
+    | `Authority (mn, rn, serial, refresh, retry, expire, min) 
+      -> (Printf.sprintf "Authority (%s, %s, %d,%d,%d,%d,%d)" 
+            mn rn (Int32.to_int serial) (Int32.to_int refresh)
+            (Int32.to_int retry) (Int32.to_int expire) (Int32.to_int min))
+    | `Address a -> Printf.sprintf "Address (%s)" (Unix.string_of_inet_addr a)
+    | `Services (a, p, bm) 
+      -> (Printf.sprintf "Services (%s, %d, %s)"
+            (Unix.string_of_inet_addr a) (int_of_byte p) bm)
+      
 let parse_question bits = 
   let n, bits = parse_name bits in
   bitmatch bits with
@@ -238,9 +300,10 @@ let parse_rr bits =
     | { _ } -> raise (Unparsable ("parse_rr", bits))
                                                         
 let rr_to_string rr = 
-  Printf.sprintf "%s <%s|%s|%s>" 
+  Printf.sprintf "%s <%s|%s|%s> %s" 
     rr.rr_name (string_of_rr_type rr.rr_type) 
     (string_of_rr_class rr.rr_class) (Int32.to_string rr.rr_ttl)
+    (string_of_resource rr.rr_rdata)
 
 let parsen pf n bits = 
   let rec aux rs n bits = 
@@ -253,13 +316,15 @@ let parsen pf n bits =
     
 let parse_dns bits = 
   bitmatch bits with
-    | { id: 16; detail: 16;
-(*        
+    | { id: 16; 
         qr: 1; opcode: 4; aa: 1; tc: 1; rd: 1; ra: 1; z: 3; rcode: 4; 
-*)
         qdcount: 16; ancount: 16; nscount: 16; arcount: 16;
         bits: -1: bitstring
       } -> 
+      let detail = { qr = qr; opcode = byte opcode;
+                     aa = aa; tc = tc; rd = rd; ra = ra;
+                     z = byte z; rcode = byte rcode } 
+      in
       let questions, bits = parsen parse_question qdcount bits in
       let answers, bits = parsen parse_rr ancount bits in
       let authorities, bits = parsen parse_rr nscount bits in
@@ -279,15 +344,15 @@ let _ =
   let bits = Bitstring.bitstring_of_file fn in
   try
     let dns = parse_dns bits in
-    Printf.printf "id:%04x detail:%04x\n" dns.id dns.detail;
+    Printf.printf "id:%04x detail:%s\n" dns.id (detail_to_string dns.detail);
     Printf.printf "qds: %s\n" 
-      (dns.questions ||> question_to_string |> join ", ");
+      (dns.questions ||> question_to_string |> join "\n\t");
     Printf.printf "ans: %s\n" 
-      (dns.answers ||> rr_to_string |> join ", ");
+      (dns.answers ||> rr_to_string |> join "\n\t");
     Printf.printf "nss: %s\n" 
-      (dns.authorities ||> rr_to_string |> join ", ");
+      (dns.authorities ||> rr_to_string |> join "\n\t");
     Printf.printf "ars: %s\n" 
-      (dns.additionals ||> rr_to_string |> join ", ")
+      (dns.additionals ||> rr_to_string |> join "\n\t")
   with
       Unparsable (where, what) ->
         Printf.printf "EXC: %s\n" where;
