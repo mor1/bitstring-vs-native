@@ -43,10 +43,17 @@ let int_of_byte b = Char.code b
 type bytes = string
 let bytes_to_hex_string bs = 
   bs |> Array.map (fun b -> sp "%02x." (int_of_byte b))
+let bytes_of_bitstring bits = string_of_bitstring bits
 
-let ip_addr_to_string = Unix.string_of_inet_addr
+let ipv4_addr_to_string = Unix.string_of_inet_addr
+let ipv4_addr_of_bytes = Obj.magic
+let ipv4_addr_of_int32 = Obj.magic
 
-type label = string
+type label = 
+  | L of string * int
+  | P of int
+  | Z
+            
 type domain_name = string
 let string o = match o with | Some x -> x | None -> ""
 
@@ -216,58 +223,75 @@ type dns = {
   additionals : rsrc_record list;
 }
 
-let parse_label bits = 
+let parse_charstr bits = 
   bitmatch bits with
-    | { length: 8: check(length != 0); name: (length*8): string; 
-        data: -1: bitstring } 
-      -> (Some name, data)
-    | { 0: 8; bits: -1: bitstring } -> (None, bits)
+    | { len: 8; str: (len*8): string; bits: -1: bitstring }
+      -> str, bits
+
+let parse_label base bits = 
+  bitmatch bits with
+    | { length: 8: check(length != 0 && length < 64), save_offset_to(ptr); 
+        name: (length*8): string; data: -1: bitstring } 
+      -> let offset = (ptr-base)/8 in
+         pr "!!! ptr:%d base:%d offset:%d\n" ptr base offset;
+         (L (name, offset), data)
+    | { 0b0_11: 2; offset: 14; bits: -1: bitstring } 
+      -> (P offset, bits)
+    | { 0: 8; bits: -1: bitstring } -> (Z, bits)
     | { _ } -> raise(Unparsable ("parse_label", bits))
 
-let parse_name bits = 
+let parse_name base bits = 
+  let names = Hashtbl.create 8 in
+  
   let rec aux name bits = 
-    match parse_label bits with
-      | (Some n, data) -> aux (n :: name) data 
-      | (None, data)   -> (name, data)
+    match parse_label base bits with
+      | (L (n, o), data) 
+        -> Hashtbl.add names o n;
+          aux (n :: name) data 
+      | (P o, data) 
+        -> let n = Hashtbl.find names o in
+           (n :: name, data)
+      | (Z, data)   
+        -> (name, data)
   in 
   let name, bits = aux [] bits in
   (join "." name, bits)
 
-let parse_resource t bits = 
+let parse_resource base t bits = 
   match t with
-    | `HINFO -> let (cpu, bits) = parse_label bits in
-                let os = bits |> parse_label |> stop in
-                `Hostinfo (string cpu, string os)
+    | `HINFO -> let (cpu, bits) = parse_charstr bits in
+                let os = bits |> parse_charstr |> stop in
+                `Hostinfo (cpu, os)
     | `MB | `MD | `MF | `MG | `MR | `NS
-    | `CNAME | `PTR -> `Domain (bits |> parse_name |> stop)
-    | `MINFO -> let (rm, bits) = parse_name bits in
-                let em = bits |> parse_name |> stop in
+    | `CNAME | `PTR -> `Domain (bits |> parse_name base |> stop)
+    | `MINFO -> let (rm, bits) = parse_name base bits in
+                let em = bits |> parse_name base |> stop in
                 `Mailbox (rm, em)
     | `MX -> (bitmatch bits with
         | { preference: 16; bits: -1: bitstring } 
-          -> `Exchange (preference, bits |> parse_name |> stop)
+          -> `Exchange (preference, bits |> parse_name base |> stop)
     )
     | `NULL -> `Data (string_of_bitstring bits)    
     | `TXT -> let names, _ = 
                 let rec aux ns bits = 
-                  let n, bits = parse_name bits in
+                  let n, bits = parse_name base bits in
                   aux (n :: ns) bits
                 in
                 aux [] bits
               in
               `Text names
-    | `SOA -> let mn, bits = parse_name bits in
-              let rn, bits = parse_name bits in 
+    | `SOA -> let mn, bits = parse_name base bits in
+              let rn, bits = parse_name base bits in 
               (bitmatch bits with
                 | { serial: 32; refresh: 32; retry: 32; expire: 32;
                     minimum: 32 }
                   -> `Authority (mn, rn, 
                                  serial, refresh, retry, expire, minimum)
               )
-    | `A -> `Address (bits |> string_of_bitstring |> Obj.magic)
+    | `A -> `Address (bits |> bytes_of_bitstring |> ipv4_addr_of_bytes)
     | `WKS -> (bitmatch bits with
         | { addr: 32; proto: 8; bitmap: -1: string } 
-          -> `Services (addr |> Obj.magic, proto |> byte, bitmap)
+          -> `Services (addr |> ipv4_addr_of_int32, proto |> byte, bitmap)
     )
 let string_of_resource r = 
   match r with
@@ -280,13 +304,13 @@ let string_of_resource r =
     | `Authority (mn, rn, serial, refresh, retry, expire, min) 
       -> (sp "Authority (%s, %s, %ld,%ld,%ld,%ld,%ld)" 
             mn rn serial refresh retry expire min)
-    | `Address a -> sp "Address (%s)" (ip_addr_to_string a)
+    | `Address a -> sp "Address (%s)" (ipv4_addr_to_string a)
     | `Services (a, p, bm) 
       -> (sp "Services (%s, %d, %s)"
             (Unix.string_of_inet_addr a) (int_of_byte p) bm)
       
-let parse_question bits = 
-  let n, bits = parse_name bits in
+let parse_question base bits = 
+  let n, bits = parse_name base bits in
   bitmatch bits with
     | { t: 16; c: 16; data: -1: bitstring }
       -> { q_name = n;
@@ -299,8 +323,8 @@ let question_to_string q =
   sp "%s <%s|%s>" 
     q.q_name (string_of_q_type q.q_type) (string_of_q_class q.q_class)
                                                          
-let parse_rr bits =
-  let name, bits = parse_name bits in
+let parse_rr base bits =
+  let name, bits = parse_name base bits in
   bitmatch bits with
     | { t: 16; c: 16; ttl: 32; 
         rdlen: 16; rdata: (rdlen*8): bitstring;
@@ -309,7 +333,7 @@ let parse_rr bits =
            rr_type = rr_type_of_int t;
            rr_class = rr_class_of_int c;
            rr_ttl = ttl;
-           rr_rdata = parse_resource (rr_type_of_int t) rdata;
+           rr_rdata = parse_resource base (rr_type_of_int t) rdata;
          }, data
     | { _ } -> raise (Unparsable ("parse_rr", bits))
                                                         
@@ -318,6 +342,7 @@ let rr_to_string rr =
     rr.rr_name 
     (string_of_rr_type rr.rr_type) (string_of_rr_class rr.rr_class) rr.rr_ttl
     (string_of_resource rr.rr_rdata)
+
 let dns_to_string d = 
   sp "%04x %s <qs:%s> <an:%s> <au:%s> <ad:%s>"
     d.id (detail_to_string d.detail) 
@@ -327,16 +352,17 @@ let dns_to_string d =
     (d.additionals ||> rr_to_string |> join ",")
 
 
-let parsen pf n bits = 
+let parsen pf b n bits = 
   let rec aux rs n bits = 
     match n with
       | 0 -> rs, bits
-      | _ -> let r, bits = pf bits in 
+      | _ -> let r, bits = pf b bits in 
              aux (r :: rs) (n-1) bits
   in
   aux [] n bits
     
 let parse_dns bits = 
+  let (_, base, _) = bits in
   bitmatch bits with
     | { id: 16; 
         qr: 1; opcode: 4; aa: 1; tc: 1; rd: 1; ra: 1; z: 3; rcode: 4; 
@@ -347,10 +373,10 @@ let parse_dns bits =
                      aa = aa; tc = tc; rd = rd; ra = ra;
                      z = byte z; rcode = byte rcode } 
       in
-      let questions, bits = parsen parse_question qdcount bits in
-      let answers, bits = parsen parse_rr ancount bits in
-      let authorities, bits = parsen parse_rr nscount bits in
-      let additionals, bits = parsen parse_rr arcount bits in
+      let questions, bits = parsen parse_question base qdcount bits in
+      let answers, bits = parsen parse_rr base ancount bits in
+      let authorities, bits = parsen parse_rr base nscount bits in
+      let additionals, bits = parsen parse_rr base arcount bits in
       { id = id; 
         detail = detail;
         questions = questions;
@@ -420,8 +446,8 @@ type ipv4 = {
 }
 let ipv4_to_string ih = 
   sp "%s > %s, (%d) [%d,%s,%s]"
-    (ip_addr_to_string ih.saddr)
-    (ip_addr_to_string ih.daddr)
+    (ipv4_addr_to_string ih.saddr)
+    (ipv4_addr_to_string ih.daddr)
     ih.proto ih.length
     (ih.flags |> ipv4_flags_to_string)
     ("") (* ih.options |> bytes_to_hex_string) *)
@@ -438,8 +464,8 @@ let parse_ipv4 bits =
       -> { version = version; hdrlen = hdrlen; tos = byte tos; length = length;
            ident = ident; flags = parse_flags flags; offset = offset;
            ttl = ttl; proto = proto; cksum = cksum;
-           saddr = source |> Obj.magic;
-           daddr = dest |> Obj.magic;
+           saddr = source |> ipv4_addr_of_int32;
+           daddr = dest |> ipv4_addr_of_int32;
            options = parse_options options;
          }, bits
   | { _ } -> raise (Unparsable ("parse_ipv4", bits))
@@ -636,6 +662,8 @@ let main_pcap () =
     let rec aux e i bits = 
       if bitstring_length bits != 0 then
         let p, bits = pcap_demux e bits in
+        let _, offset, length = bits in
+        pr "!!! %d %d\n" offset length;
         pr "%d: %s\n" i (p |> packet_to_string);
         aux e (i+1) bits
     in
