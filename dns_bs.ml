@@ -41,6 +41,11 @@ let byte (i:int) : char = Char.chr i
 let int_of_byte b = Char.code b
 
 type bytes = string
+let bytes_to_hex_string bs = 
+  bs |> Array.map (fun b -> sp "%02x." (int_of_byte b))
+
+let ip_addr_to_string = Unix.string_of_inet_addr
+
 type label = string
 type domain_name = string
 let string o = match o with | Some x -> x | None -> ""
@@ -202,7 +207,7 @@ let detail_to_string d =
     (if d.ra then "can-recurse" else "no-recurse")
     (int_of_byte d.z) (int_of_byte d.rcode)
                
-type dns_packet = {
+type dns = {
   id          : int16;
   detail      : detail;
   questions   : question list;
@@ -246,7 +251,6 @@ let parse_resource t bits =
     | `TXT -> let names, _ = 
                 let rec aux ns bits = 
                   let n, bits = parse_name bits in
-                  pr "!!! %d\n" (bits |> bitstring_length);
                   aux (n :: ns) bits
                 in
                 aux [] bits
@@ -276,7 +280,7 @@ let string_of_resource r =
     | `Authority (mn, rn, serial, refresh, retry, expire, min) 
       -> (sp "Authority (%s, %s, %ld,%ld,%ld,%ld,%ld)" 
             mn rn serial refresh retry expire min)
-    | `Address a -> sp "Address (%s)" (Unix.string_of_inet_addr a)
+    | `Address a -> sp "Address (%s)" (ip_addr_to_string a)
     | `Services (a, p, bm) 
       -> (sp "Services (%s, %d, %s)"
             (Unix.string_of_inet_addr a) (int_of_byte p) bm)
@@ -314,6 +318,14 @@ let rr_to_string rr =
     rr.rr_name 
     (string_of_rr_type rr.rr_type) (string_of_rr_class rr.rr_class) rr.rr_ttl
     (string_of_resource rr.rr_rdata)
+let dns_to_string d = 
+  sp "%04x %s <qs:%s> <an:%s> <au:%s> <ad:%s>"
+    d.id (detail_to_string d.detail) 
+    (d.questions ||> question_to_string |> join ",")
+    (d.answers ||> rr_to_string |> join ",")
+    (d.authorities ||> rr_to_string |> join ",")
+    (d.additionals ||> rr_to_string |> join ",")
+
 
 let parsen pf n bits = 
   let rec aux rs n bits = 
@@ -349,17 +361,19 @@ let parse_dns bits =
 
     | { _ } -> raise (Unparsable ("parse_dns", bits))
 
-type ip_flags = {
+type ipv4_flags = {
   df: bool;
   mf: bool;
 }
+let ipv4_flags_to_string fs = 
+  sp "%s:%s" (if fs.df then "DF" else ".") (if fs.mf then "MF" else ".")
 
 let parse_flags b = 
   { df = (b &&& 0b0_010) != 0;
     mf = (b &&& 0b0_001) != 0;
   }
 
-type ip_option = [
+type ipv4_option = [
 | `NOP
 | `Security of bytes
 | `LooseSR of int * bytes
@@ -368,6 +382,7 @@ type ip_option = [
 | `StreamID of int32
 (* | `Timestamp*) 
 ]  
+   
 let parse_options bits = 
   let rec aux os bits = 
     bitmatch bits with
@@ -385,7 +400,8 @@ let parse_options bits =
         -> aux (`StreamID streamid :: os) bits
       | { _ } -> raise (Unparsable ("parse_options", bits))
   in
-  aux [] bits
+(* aux [] bits *)
+  []
           
 type ipv4 = {
   version: int;
@@ -393,15 +409,22 @@ type ipv4 = {
   tos: byte;
   length: int16;
   ident: int16;
-  flags: ip_flags;
+  flags: ipv4_flags;
   offset: int;
   ttl: int8;
   proto: int8;
   cksum: int16;
   saddr: Unix.inet_addr;
   daddr: Unix.inet_addr;
-  options: ip_option list;
+  options: ipv4_option list;
 }
+let ipv4_to_string ih = 
+  sp "%s > %s, (%d) [%d,%s,%s]"
+    (ip_addr_to_string ih.saddr)
+    (ip_addr_to_string ih.daddr)
+    ih.proto ih.length
+    (ih.flags |> ipv4_flags_to_string)
+    ("") (* ih.options |> bytes_to_hex_string) *)
 
 let parse_ipv4 bits = 
   bitmatch bits with
@@ -420,13 +443,35 @@ let parse_ipv4 bits =
            options = parse_options options;
          }, bits
   | { _ } -> raise (Unparsable ("parse_ipv4", bits))
-                                                    
+
+type eaddr = string
+type eth = {
+  dmac: eaddr;
+  smac: eaddr;
+  etype: int16;
+}
+let eaddr_to_string e = 
+  sp "%02x-%02x-%02x-%02x-%02x-%02x" 
+    (int_of_byte e.[0]) (int_of_byte e.[1]) (int_of_byte e.[2])
+    (int_of_byte e.[3]) (int_of_byte e.[4]) (int_of_byte e.[5])
+
+let parse_eth bits = 
+  bitmatch bits with
+    | { dmac: 48: string; smac: 48: string; etype: 16; 
+        bits: -1: bitstring }
+      -> { dmac=dmac; smac=smac; etype=etype; }, bits
+let eth_to_string h = 
+  sp "%s > %s [%04x]" (eaddr_to_string h.smac) (eaddr_to_string h.dmac) h.etype
+  
 type udp = {
   sport: int16;
   dport: int16;
   length: int16;
   cksum: int16;
 }
+let udp_to_string u = 
+  sp "%d,%d" u.sport u.dport
+
 let parse_udp bits = 
   bitmatch bits with
     | { sport: 16; dport: 16; length: 16; cksum: 16; bits: -1: bitstring }
@@ -460,16 +505,75 @@ let parse_pcap e bits =
 let pcap_to_string p = 
   sp "%ld.%06ld [%ld/%ld]" p.ts_secs p.ts_usecs p.caplen p.pktlen
 
-type packet = [
+type packet =
 | PCAP of pcap * packet
 | ETH of eth * packet
 | IPv4 of ipv4 * packet
 | UDP of udp * packet
-| DNS of dns_packet
+| DNS of dns
 
+let is_wellknown_port p  = ((    0 <= p) && (p <=  1023))
+let is_registered_port p = (( 1024 <= p) && (p <= 49151))
+let is_ephemeral_port p  = ((49152 <= p) && (p <= 65535)) 
+let svc_port p q = 
+  match p,q with
+    | p,_ when p |> is_wellknown_port -> p
+    | _,q when q |> is_wellknown_port -> q
+    
+    | p,_ when p |> is_registered_port -> p
+    | _,q when q |> is_registered_port -> q
+
+    | _ -> min p q (* just default to the minimum *)
+      
+let port_dns = 53
+let udp_demux bits = 
+  let uh, bits = parse_udp bits in 
+  UDP (uh, (match svc_port uh.sport uh.dport with
+    | port_dns -> DNS (parse_dns bits)
+  ))
+
+let proto_icmp =   1
+let proto_tcp  =   6
+let proto_udp  =  17
+let ipv4_demux bits = 
+  let ih, bits = parse_ipv4 bits in 
+  IPv4(ih, bits |> (match ih.proto with
+    | proto_udp -> udp_demux
+  ))
+
+let packet_to_string pkt = 
+  let rec aux p sep str = 
+    match p with
+      | PCAP (h, d) -> let str = sp "%sPCAP(%s)%s" str (pcap_to_string h) sep in
+                       aux d sep str  
+      | ETH (h, d) -> let str = sp "%sETH(%s)%s" str (eth_to_string h) sep in
+                      aux d sep str
+      | IPv4 (h, d) -> let str = sp "%sIPv4(%s)%s" str (ipv4_to_string h) sep in
+                       aux d sep str
+      | UDP (h, d) -> let str = sp "%sUDP(%s)%s" str (udp_to_string h) sep in
+                      aux d sep str
+
+      | DNS d -> sp "%sDNS(%s)" str (dns_to_string d)
+  in
+  aux pkt "\n\t|" ""
+    
+let etype_ipv4 = 0x0800
+let etype_arp  = 0x0806
+let etype_ipx  = 0x8137
+let etype_ipv6 = 0x86dd
+let eth_demux bits = 
+  let eh, bits = parse_eth bits in
+  ETH(eh, bits |> (match eh.etype with
+    | etype_ipv4 -> ipv4_demux
+  ))
+let pcap_demux e bits = 
+  let ph, bits = parse_pcap e bits in
+  PCAP (ph, ph.pkt |> eth_demux), bits
+                         
 type pcap_file = {
   magic: int32;
-  major: int16; minor: int16;
+  major: int16; 
+  minor: int16;
   tzone: int32;
   snaplen: int32;
   linktype: int32;
@@ -526,14 +630,18 @@ let main_pcap () =
   let fn = "test.pcap" in
   let bits = bitstring_of_file fn in
   try
-    let h, ps = parse_pcap_file bits in
-    pr "PCAP FILE: %s\n" (pcap_file_to_string h);
+    let hdr, pkts = parse_pcap_file bits in
+    pr "PCAP FILE: %s\n" (pcap_file_to_string hdr);
+
     let rec aux e i bits = 
       if bitstring_length bits != 0 then
-        let p, bits = parse_pcap e bits in
-        pr "%d: %s\n" i (pcap_to_string p);
+        let p, bits = pcap_demux e bits in
+        pr "%d: %s\n" i (p |> packet_to_string);
         aux e (i+1) bits
-    in aux (endian_of h.magic) 0 ps
+    in
+    let e = endian_of hdr.magic in
+    aux e 0 pkts
+
   with
       Unparsable (where, what) ->
         ep "EXC: %s\n" where;
@@ -541,4 +649,3 @@ let main_pcap () =
 
 let _ = main_dns_direct ()
 let _ = main_pcap ()
-
