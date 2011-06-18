@@ -403,21 +403,15 @@ let parse_dns bits =
         qdcount: 16; ancount: 16; nscount: 16; arcount: 16;
         bits: -1: bitstring
       }
-      -> let detail = { qr = qr; opcode = byte opcode;
-                        aa = aa; tc = tc; rd = rd; ra = ra;
+      -> let detail = { qr; opcode = byte opcode;
+                        aa; tc; rd; ra;
                         z = byte z; rcode = byte rcode } 
          in
          let questions, bits = parsen parse_question names base qdcount bits in
          let answers, bits = parsen parse_rr names base ancount bits in
          let authorities, bits = parsen parse_rr names base nscount bits in
          let additionals, bits = parsen parse_rr names base arcount bits in
-         { id = id; 
-           detail = detail;
-           questions = questions;
-           answers = answers;
-           authorities = authorities;
-           additionals = additionals;
-         }
+         { id; detail; questions; answers; authorities; additionals }
 
     | { _ } -> raise (Unparsable ("parse_dns", bits))
 
@@ -502,16 +496,13 @@ let parse_ipv4 bits =
     | { 4: 4; hdrlen: 4; tos: 8; length: 16;
         ident: 16; flags: 3; offset: 13;
         ttl: 8; proto: 8; cksum: 16;
-        source: 32; dest: 32;
+        saddr: 32; daddr: 32;
         options: (hdrlen-5)*32: bitstring;
         bits: -1: bitstring 
       }
-      -> { version = 4; hdrlen = hdrlen; tos = byte tos; length = length;
-           ident = ident; 
+      -> { version = 4; hdrlen; tos = byte tos; length; ident; 
            flags = flags |> Int32.of_int |> parse_flags; 
-           offset = offset;
-           ttl = ttl; proto = proto; cksum = cksum;
-           saddr = source; daddr = dest;
+           offset; ttl; proto; cksum; saddr; daddr;
            options = parse_options options;
          }, bits
     | { _ } -> raise (Unparsable ("parse_ipv4", bits))
@@ -549,9 +540,8 @@ let udp_to_string u =
 let parse_udp bits = 
   bitmatch bits with
     | { sport: 16; dport: 16; length: 16; cksum: 16; bits: -1: bitstring }
-      -> { sport = sport; dport = dport; 
-           length = length; cksum = cksum;
-         }, bits
+      -> { sport; dport; length; cksum }, bits
+
     | { _ } -> raise (Unparsable ("parse_udp", bits))
 
 type pcap = {
@@ -570,11 +560,7 @@ let parse_pcap e bits =
         pktlen: 32: endian (e);
         pkt: (Int32.to_int caplen*8): bitstring;
         bits: -1: bitstring
-      }
-      -> { ts_secs = ts_secs; ts_usecs = ts_usecs;
-           caplen = caplen; pktlen = pktlen; 
-           pkt = pkt;
-         }, bits        
+      } -> { ts_secs; ts_usecs; caplen; pktlen; pkt }, bits
 
     | { _ } -> raise (Unparsable ("parse_pcap", bits))
   )
@@ -680,12 +666,7 @@ let parse_pcap_file bits =
         linktype: 32: endian (endian_of magic);
         bits: -1: bitstring
       }
-      -> { magic = magic;
-           major = major; minor = minor;
-           tzone = tzone;
-           snaplen = snaplen;
-           linktype = linktype;
-         }, bits        
+      -> { magic; major; minor; tzone; snaplen; linktype }, bits
 
 let main_pcap () = 
   let fn = Sys.argv.(1) in
