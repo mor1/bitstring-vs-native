@@ -21,38 +21,53 @@ let ep = Printf.eprintf
 
 exception Unparsable of string * bitstring
 
-let (|>) x f = f x
-let (>>) f g x = g (f x)
-let (||>) l f = List.map f l
+let (|>) x f = f x (* pipe *)
+let (>>) f g x = g (f x) (* functor pipe *)
+let (||>) l f = List.map f l (* element-wise pipe *)
 
-let (&&&) x y = x land y
-let (|||) x y = x lor y
-let (^^^) x y = x lxor y
-let (<<<) x y = x lsl y
-let (>>>) x y = x lsr y
+let (&&&) x y = Int32.logand x y
+let (|||) x y = Int32.logor x y
+let (^^^) x y = Int32.logxor x y
+let (<<<) x y = Int32.shift_left x y
+let (>>>) x y = Int32.shift_right_logical x y
 
 let join c l = List.fold_left (fun x y -> y ^ c ^ x) "" l
-let stop (x, bits) = x
+let stop (x, bits) = x (* drop remainder to stop parsing and demuxing *) 
+
+let bitstring_offset bits = 
+  let (_, offset, _) = bits in offset
+
+let bsp bits = 
+  let (_, o, l) = bits in sp "%d[%d],%d[%d]" o (o/8) l (l/8)
 
 type int8 = int
 type int16 = int
 type byte = char
+
 let byte (i:int) : char = Char.chr i
-let int_of_byte b = Char.code b
+let int_of_byte b = int_of_char b
+let int32_of_byte b = b |> int_of_char |> Int32.of_int
 
 type bytes = string
 let bytes_to_hex_string bs = 
   bs |> Array.map (fun b -> sp "%02x." (int_of_byte b))
 let bytes_of_bitstring bits = string_of_bitstring bits
 
-let ipv4_addr_to_string = Unix.string_of_inet_addr
-let ipv4_addr_of_bytes = Obj.magic
-let ipv4_addr_of_int32 = Obj.magic
+let ipv4_addr_of_bytes bs = 
+  ((bs.[0] |> int32_of_byte <<< 24) ||| (bs.[1] |> int32_of_byte <<< 16) 
+    ||| (bs.[2] |> int32_of_byte <<< 8) ||| (bs.[3] |> int32_of_byte))
+
+let ipv4_addr_to_string i = 
+  sp "%ld.%ld.%ld.%ld" 
+    ((i &&& 0x0_ff000000_l) >>> 24)
+    ((i &&& 0x0_00ff0000_l) >>> 16)
+    ((i &&& 0x0_0000ff00_l) >>>  8)
+    ((i &&& 0x0_000000ff_l)       )
 
 type label = 
-  | L of string * int
-  | P of int
-  | Z
+  | L of string * int (* string *)
+  | P of int * int (* pointer *)
+  | Z of int (* zero; terminator *)
             
 type domain_name = string
 let string o = match o with | Some x -> x | None -> ""
@@ -136,7 +151,8 @@ and q_type_of_int : int -> q_type = function
   | 255           -> `ANY
   | n             -> (rr_type_of_int n :> q_type)
 
-type rr_class = [ `INx (* why can this not be `IN??? *) 
+type rr_class = [ `INx (* why can this not be `IN??? camlp4 bug, fixed
+                          in ocaml 3.12.1 *) 
                 | `CS | `CH | `HS ]
 
 type q_class = [ rr_class | `ANY ]
@@ -176,8 +192,8 @@ type resource = [
 | `Data      of bytes
 | `Text      of string list
 | `Authority of domain_name * domain_name * int32 * int32 * int32 * int32 * int32
-| `Address   of Unix.inet_addr
-| `Services  of Unix.inet_addr * byte * bytes
+| `Address   of int32
+| `Services  of int32 * byte * bytes
 ]
 
 type rsrc_record = {
@@ -204,14 +220,15 @@ type detail = {
   z: byte;
   rcode: byte;  
 }
+
 let detail_to_string d = 
   sp "%c:%02x %s:%s:%s:%s %02x %d"
     (if d.qr then 'R' else 'Q')
     (int_of_byte d.opcode)
-    (if d.aa then "auth" else "non-auth")
-    (if d.tc then "trunc" else "complete")
-    (if d.rd then "recurse" else "non-rec")
-    (if d.ra then "can-recurse" else "no-recurse")
+    (if d.aa then "a" else "na") (* authoritative vs not *)
+    (if d.tc then "t" else "c") (* truncated vs complete *)
+    (if d.rd then "r" else "nr") (* recursive vs not *)
+    (if d.ra then "ra" else "rn") (* recursion available vs not *)
     (int_of_byte d.z) (int_of_byte d.rcode)
                
 type dns = {
@@ -229,59 +246,75 @@ let parse_charstr bits =
       -> str, bits
 
 let parse_label base bits = 
-  bitmatch bits with
-    | { length: 8: check(length != 0 && length < 64), save_offset_to(ptr); 
+  let cur = bitstring_offset bits in
+  let offset = (cur-base)/8 in
+  (bitmatch bits with
+    | { length: 8: check(length != 0 && length < 64); 
         name: (length*8): string; data: -1: bitstring } 
-      -> let offset = (ptr-base)/8 in
-         pr "!!! ptr:%d base:%d offset:%d\n" ptr base offset;
-         (L (name, offset), data)
-    | { 0b0_11: 2; offset: 14; bits: -1: bitstring } 
-      -> (P offset, bits)
-    | { 0: 8; bits: -1: bitstring } -> (Z, bits)
+      -> (L (name, offset), data)
+    | { 0b0_11: 2; ptr: 14; bits: -1: bitstring } 
+      -> (P (ptr, offset), bits)
+    | { 0: 8; bits: -1: bitstring } 
+      -> (Z offset, bits)
     | { _ } -> raise(Unparsable ("parse_label", bits))
+  )
 
-let parse_name base bits = 
-  let names = Hashtbl.create 8 in
-  
-  let rec aux name bits = 
+let parse_name names base bits = 
+  (* what. a. mess. *)
+  let rec aux offsets name bits = 
     match parse_label base bits with
-      | (L (n, o), data) 
-        -> Hashtbl.add names o n;
-          aux (n :: name) data 
-      | (P o, data) 
-        -> let n = Hashtbl.find names o in
-           (n :: name, data)
-      | (Z, data)   
-        -> (name, data)
+      | (L (n, o) as label, data) 
+        -> Hashtbl.add names o label;
+          offsets |> List.iter (fun off -> (
+            Hashtbl.add names off label
+          ));
+          aux (o :: offsets) (n :: name) data 
+      | (P (p, _), data) 
+        -> let ns = (Hashtbl.find_all names p 
+                        |> List.filter (fun n ->
+                          match n with L _ -> true | _ -> false)
+                        |> List.rev)
+           in
+           offsets |> List.iter (fun off ->
+             ns |> List.iter (fun n -> Hashtbl.add names off n)
+           );
+           ((ns |> List.rev
+             ||> (fun n -> match n with 
+                 | L (nm,_) -> nm
+                 | _ -> raise(Unparsable ("parse_name", bits)))) 
+            @ name), data
+      | (Z o as zero, data)
+        -> Hashtbl.add names o zero;
+          (name, data)
   in 
-  let name, bits = aux [] bits in
+  let name, bits = aux [] [] bits in
   (join "." name, bits)
 
-let parse_resource base t bits = 
+let parse_resource names base t bits = 
   match t with
     | `HINFO -> let (cpu, bits) = parse_charstr bits in
                 let os = bits |> parse_charstr |> stop in
                 `Hostinfo (cpu, os)
     | `MB | `MD | `MF | `MG | `MR | `NS
-    | `CNAME | `PTR -> `Domain (bits |> parse_name base |> stop)
-    | `MINFO -> let (rm, bits) = parse_name base bits in
-                let em = bits |> parse_name base |> stop in
+    | `CNAME | `PTR -> `Domain (bits |> parse_name names base |> stop)
+    | `MINFO -> let (rm, bits) = parse_name names base bits in
+                let em = bits |> parse_name names base |> stop in
                 `Mailbox (rm, em)
     | `MX -> (bitmatch bits with
         | { preference: 16; bits: -1: bitstring } 
-          -> `Exchange (preference, bits |> parse_name base |> stop)
+          -> `Exchange (preference, bits |> parse_name names base |> stop)
     )
     | `NULL -> `Data (string_of_bitstring bits)    
     | `TXT -> let names, _ = 
                 let rec aux ns bits = 
-                  let n, bits = parse_name base bits in
+                  let n, bits = parse_name names base bits in
                   aux (n :: ns) bits
                 in
                 aux [] bits
               in
               `Text names
-    | `SOA -> let mn, bits = parse_name base bits in
-              let rn, bits = parse_name base bits in 
+    | `SOA -> let mn, bits = parse_name names base bits in
+              let rn, bits = parse_name names base bits in 
               (bitmatch bits with
                 | { serial: 32; refresh: 32; retry: 32; expire: 32;
                     minimum: 32 }
@@ -291,8 +324,9 @@ let parse_resource base t bits =
     | `A -> `Address (bits |> bytes_of_bitstring |> ipv4_addr_of_bytes)
     | `WKS -> (bitmatch bits with
         | { addr: 32; proto: 8; bitmap: -1: string } 
-          -> `Services (addr |> ipv4_addr_of_int32, proto |> byte, bitmap)
+          -> `Services (addr, proto |> byte, bitmap)
     )
+
 let string_of_resource r = 
   match r with
     | `Hostinfo (cpu, os) -> sp "Hostinfo (%s, %s)" cpu os
@@ -307,10 +341,10 @@ let string_of_resource r =
     | `Address a -> sp "Address (%s)" (ipv4_addr_to_string a)
     | `Services (a, p, bm) 
       -> (sp "Services (%s, %d, %s)"
-            (Unix.string_of_inet_addr a) (int_of_byte p) bm)
+            (ipv4_addr_to_string a) (int_of_byte p) bm)
       
-let parse_question base bits = 
-  let n, bits = parse_name base bits in
+let parse_question names base bits = 
+  let n, bits = parse_name names base bits in
   bitmatch bits with
     | { t: 16; c: 16; data: -1: bitstring }
       -> { q_name = n;
@@ -322,9 +356,9 @@ let parse_question base bits =
 let question_to_string q = 
   sp "%s <%s|%s>" 
     q.q_name (string_of_q_type q.q_type) (string_of_q_class q.q_class)
-                                                         
-let parse_rr base bits =
-  let name, bits = parse_name base bits in
+    
+let parse_rr names base bits =
+  let name, bits = parse_name names base bits in
   bitmatch bits with
     | { t: 16; c: 16; ttl: 32; 
         rdlen: 16; rdata: (rdlen*8): bitstring;
@@ -333,10 +367,10 @@ let parse_rr base bits =
            rr_type = rr_type_of_int t;
            rr_class = rr_class_of_int c;
            rr_ttl = ttl;
-           rr_rdata = parse_resource base (rr_type_of_int t) rdata;
+           rr_rdata = parse_resource names base (rr_type_of_int t) rdata;
          }, data
     | { _ } -> raise (Unparsable ("parse_rr", bits))
-                                                        
+      
 let rr_to_string rr = 
   sp "%s <%s|%s|%ld> %s" 
     rr.rr_name 
@@ -351,39 +385,39 @@ let dns_to_string d =
     (d.authorities ||> rr_to_string |> join ",")
     (d.additionals ||> rr_to_string |> join ",")
 
-
-let parsen pf b n bits = 
+let parsen pf ns b n bits = 
   let rec aux rs n bits = 
     match n with
       | 0 -> rs, bits
-      | _ -> let r, bits = pf b bits in 
+      | _ -> let r, bits = pf ns b bits in 
              aux (r :: rs) (n-1) bits
   in
   aux [] n bits
     
 let parse_dns bits = 
+  let names = Hashtbl.create 8 in
   let (_, base, _) = bits in
   bitmatch bits with
     | { id: 16; 
         qr: 1; opcode: 4; aa: 1; tc: 1; rd: 1; ra: 1; z: 3; rcode: 4; 
         qdcount: 16; ancount: 16; nscount: 16; arcount: 16;
         bits: -1: bitstring
-      } -> 
-      let detail = { qr = qr; opcode = byte opcode;
-                     aa = aa; tc = tc; rd = rd; ra = ra;
-                     z = byte z; rcode = byte rcode } 
-      in
-      let questions, bits = parsen parse_question base qdcount bits in
-      let answers, bits = parsen parse_rr base ancount bits in
-      let authorities, bits = parsen parse_rr base nscount bits in
-      let additionals, bits = parsen parse_rr base arcount bits in
-      { id = id; 
-        detail = detail;
-        questions = questions;
-        answers = answers;
-        authorities = authorities;
-        additionals = additionals;
       }
+      -> let detail = { qr = qr; opcode = byte opcode;
+                        aa = aa; tc = tc; rd = rd; ra = ra;
+                        z = byte z; rcode = byte rcode } 
+         in
+         let questions, bits = parsen parse_question names base qdcount bits in
+         let answers, bits = parsen parse_rr names base ancount bits in
+         let authorities, bits = parsen parse_rr names base nscount bits in
+         let additionals, bits = parsen parse_rr names base arcount bits in
+         { id = id; 
+           detail = detail;
+           questions = questions;
+           answers = answers;
+           authorities = authorities;
+           additionals = additionals;
+         }
 
     | { _ } -> raise (Unparsable ("parse_dns", bits))
 
@@ -391,43 +425,54 @@ type ipv4_flags = {
   df: bool;
   mf: bool;
 }
+
 let ipv4_flags_to_string fs = 
   sp "%s:%s" (if fs.df then "DF" else ".") (if fs.mf then "MF" else ".")
 
 let parse_flags b = 
-  { df = (b &&& 0b0_010) != 0;
-    mf = (b &&& 0b0_001) != 0;
+  { df = ((b &&& 0b0_010_l) != 0_l);
+    mf = ((b &&& 0b0_001_l) != 0_l);
   }
 
-type ipv4_option = [
-| `NOP
-| `Security of bytes
-| `LooseSR of int * bytes
-| `StrictSR of int * bytes
-| `RecordR of int * bytes
-| `StreamID of int32
+type ipv4_option =
+| NOP
+| Security of bytes
+| LooseSR of int * bytes
+| StrictSR of int * bytes
+| RecordR of int * bytes
+| StreamID of int32
 (* | `Timestamp*) 
-]  
-   
+
+let ipv4_option_to_string = function
+  | NOP -> "nop"
+  | Security _ -> "sec"
+  | LooseSR _ -> "lsr"
+  | StrictSR _ -> "ssr"
+  | RecordR _ -> "rr"
+  | StreamID (s) -> sp "stream(%08lx)" s
+
 let parse_options bits = 
-  let rec aux os bits = 
-    bitmatch bits with
-      | { 0: 8 } -> os
-      | { 1: 8 } -> aux (`NOP :: os) bits
-      | { 130: 8; len: 8: check(len == 11*8) ; data: len: string } 
-        -> aux (`Security data :: os) bits
-      | { 131: 8; len: 8; ptr: 8; route: (len-3)*8: string }
-        -> aux (`LooseSR (ptr, route) :: os) bits
-      | { 137: 8; len: 8; ptr: 8; route: (len-3)*8: string }
-        -> aux (`StrictSR (ptr, route) :: os) bits
-      | { 7: 8; len: 8; ptr: 8; route: (len-3)*8: string }
-        -> aux (`RecordR (ptr, route) :: os) bits
-      | { 136: 8; 4: 8; streamid: 32 }
-        -> aux (`StreamID streamid :: os) bits
-      | { _ } -> raise (Unparsable ("parse_options", bits))
-  in
-(* aux [] bits *)
-  []
+  if bitstring_length bits = 0 then []
+  else 
+    let rec aux os bits = 
+      pr "%s\n" (bsp bits); hexdump_bitstring stdout bits;
+      (bitmatch bits with
+        | { 0: 8 } -> os
+        | { 1: 8; bits: -1: bitstring } -> aux (NOP :: os) bits
+        | { 130: 8; len: 8: check(len == 11*8) ; data: len: string; bits: -1: bitstring } 
+          -> aux (Security data :: os) bits
+        | { 131: 8; len: 8; ptr: 8; route: (len-3)*8: string; bits: -1: bitstring }
+          -> aux (LooseSR (ptr, route) :: os) bits
+        | { 137: 8; len: 8; ptr: 8; route: (len-3)*8: string; bits: -1: bitstring }
+          -> aux (StrictSR (ptr, route) :: os) bits
+        | { 7: 8; len: 8; ptr: 8; route: (len-3)*8: string; bits: -1: bitstring }
+          -> aux (RecordR (ptr, route) :: os) bits
+        | { 136: 8; 4: 8; streamid: 32; bits: -1: bitstring }
+          -> aux (StreamID (streamid) :: os) bits
+        | { _ } -> raise (Unparsable ("parse_options", bits))
+      )
+    in
+    aux [] bits 
           
 type ipv4 = {
   version: int;
@@ -440,35 +485,37 @@ type ipv4 = {
   ttl: int8;
   proto: int8;
   cksum: int16;
-  saddr: Unix.inet_addr;
-  daddr: Unix.inet_addr;
+  saddr: int32;
+  daddr: int32;
   options: ipv4_option list;
 }
+
 let ipv4_to_string ih = 
   sp "%s > %s, (%d) [%d,%s,%s]"
-    (ipv4_addr_to_string ih.saddr)
-    (ipv4_addr_to_string ih.daddr)
-    ih.proto ih.length
-    (ih.flags |> ipv4_flags_to_string)
-    ("") (* ih.options |> bytes_to_hex_string) *)
+    (ipv4_addr_to_string ih.saddr) (ipv4_addr_to_string ih.daddr)
+    ih.proto 
+    ih.length (ih.flags |> ipv4_flags_to_string)
+    (ih.options ||> ipv4_option_to_string |> join ":")
 
 let parse_ipv4 bits = 
-  bitmatch bits with
-  | { version: 4; hdrlen: 4; tos: 8; length: 16;
-      ident: 16; flags: 3; offset: 13;
-      ttl: 8; proto: 8; cksum: 16;
-      source: 32; dest: 32;
-      options: (hdrlen-5)*32: bitstring;
-      bits: -1: bitstring 
-    } when version = 4 
-      -> { version = version; hdrlen = hdrlen; tos = byte tos; length = length;
-           ident = ident; flags = parse_flags flags; offset = offset;
+  (bitmatch bits with
+    | { 4: 4; hdrlen: 4; tos: 8; length: 16;
+        ident: 16; flags: 3; offset: 13;
+        ttl: 8; proto: 8; cksum: 16;
+        source: 32; dest: 32;
+        options: (hdrlen-5)*32: bitstring;
+        bits: -1: bitstring 
+      }
+      -> { version = 4; hdrlen = hdrlen; tos = byte tos; length = length;
+           ident = ident; 
+           flags = flags |> Int32.of_int |> parse_flags; 
+           offset = offset;
            ttl = ttl; proto = proto; cksum = cksum;
-           saddr = source |> ipv4_addr_of_int32;
-           daddr = dest |> ipv4_addr_of_int32;
+           saddr = source; daddr = dest;
            options = parse_options options;
          }, bits
-  | { _ } -> raise (Unparsable ("parse_ipv4", bits))
+    | { _ } -> raise (Unparsable ("parse_ipv4", bits))
+  )
 
 type eaddr = string
 type eth = {
@@ -495,6 +542,7 @@ type udp = {
   length: int16;
   cksum: int16;
 }
+
 let udp_to_string u = 
   sp "%d,%d" u.sport u.dport
 
@@ -511,10 +559,11 @@ type pcap = {
   ts_usecs: int32;
   caplen: int32;
   pktlen: int32;
-  pkt: bitstring;                
+  pkt: bitstring;
 }
+
 let parse_pcap e bits = 
-  bitmatch bits with
+  (bitmatch bits with
     | { ts_secs: 32: endian (e);
         ts_usecs: 32: endian (e);
         caplen: 32: endian (e);
@@ -528,6 +577,8 @@ let parse_pcap e bits =
          }, bits        
 
     | { _ } -> raise (Unparsable ("parse_pcap", bits))
+  )
+
 let pcap_to_string p = 
   sp "%ld.%06ld [%ld/%ld]" p.ts_secs p.ts_usecs p.caplen p.pktlen
 
@@ -543,19 +594,20 @@ let is_registered_port p = (( 1024 <= p) && (p <= 49151))
 let is_ephemeral_port p  = ((49152 <= p) && (p <= 65535)) 
 let svc_port p q = 
   match p,q with
-    | p,_ when p |> is_wellknown_port -> p
-    | _,q when q |> is_wellknown_port -> q
+    | p,_ when p |> is_wellknown_port -> Some p
+    | _,q when q |> is_wellknown_port -> Some q
     
-    | p,_ when p |> is_registered_port -> p
-    | _,q when q |> is_registered_port -> q
+    | p,_ when p |> is_registered_port -> Some p
+    | _,q when q |> is_registered_port -> Some q
 
-    | _ -> min p q (* just default to the minimum *)
+    | _ -> None
       
 let port_dns = 53
 let udp_demux bits = 
   let uh, bits = parse_udp bits in 
   UDP (uh, (match svc_port uh.sport uh.dport with
-    | port_dns -> DNS (parse_dns bits)
+    | Some port_dns -> DNS (parse_dns bits)
+    | None -> raise(Unparsable("udp_demux", bits))
   ))
 
 let proto_icmp =   1
@@ -567,21 +619,21 @@ let ipv4_demux bits =
     | proto_udp -> udp_demux
   ))
 
-let packet_to_string pkt = 
-  let rec aux p sep str = 
+let packet_to_string sep pkt = 
+  let rec aux p str = 
     match p with
       | PCAP (h, d) -> let str = sp "%sPCAP(%s)%s" str (pcap_to_string h) sep in
-                       aux d sep str  
+                       aux d str  
       | ETH (h, d) -> let str = sp "%sETH(%s)%s" str (eth_to_string h) sep in
-                      aux d sep str
+                      aux d str
       | IPv4 (h, d) -> let str = sp "%sIPv4(%s)%s" str (ipv4_to_string h) sep in
-                       aux d sep str
+                       aux d str
       | UDP (h, d) -> let str = sp "%sUDP(%s)%s" str (udp_to_string h) sep in
-                      aux d sep str
+                      aux d str
 
       | DNS d -> sp "%sDNS(%s)" str (dns_to_string d)
   in
-  aux pkt "\n\t|" ""
+  aux pkt ""
     
 let etype_ipv4 = 0x0800
 let etype_arp  = 0x0806
@@ -592,6 +644,7 @@ let eth_demux bits =
   ETH(eh, bits |> (match eh.etype with
     | etype_ipv4 -> ipv4_demux
   ))
+
 let pcap_demux e bits = 
   let ph, bits = parse_pcap e bits in
   PCAP (ph, ph.pkt |> eth_demux), bits
@@ -604,6 +657,7 @@ type pcap_file = {
   snaplen: int32;
   linktype: int32;
 }
+
 let pcap_file_to_string pf =
   sp "(%08lx) %d.%d tzone:%ld snaplen:%ld linktype:%ld"
     pf.magic pf.major pf.minor pf.tzone pf.snaplen pf.linktype
@@ -633,47 +687,24 @@ let parse_pcap_file bits =
            linktype = linktype;
          }, bits        
 
-let main_dns_direct () = 
-  let fn = "dns.dat" in
-  let bits = bitstring_of_file fn in
-  try
-    let dns = parse_dns bits in
-    pr "id:%04x detail:%s\n" dns.id (detail_to_string dns.detail);
-    pr "qds: %s\n" 
-      (dns.questions ||> question_to_string |> join "\n\t");
-    pr "ans: %s\n" 
-      (dns.answers ||> rr_to_string |> join "\n\t");
-    pr "nss: %s\n" 
-      (dns.authorities ||> rr_to_string |> join "\n\t");
-    pr "ars: %s\n" 
-      (dns.additionals ||> rr_to_string |> join "\n\t")
-  with
-      Unparsable (where, what) ->
-        pr "EXC: %s\n" where;
-        hexdump_bitstring stdout what
-
 let main_pcap () = 
-  let fn = "test.pcap" in
+  let fn = Sys.argv.(1) in
   let bits = bitstring_of_file fn in
   try
     let hdr, pkts = parse_pcap_file bits in
     pr "PCAP FILE: %s\n" (pcap_file_to_string hdr);
 
-    let rec aux e i bits = 
+    let e = endian_of hdr.magic in
+    let rec aux i bits = 
       if bitstring_length bits != 0 then
         let p, bits = pcap_demux e bits in
-        let _, offset, length = bits in
-        pr "!!! %d %d\n" offset length;
-        pr "%d: %s\n" i (p |> packet_to_string);
-        aux e (i+1) bits
+        pr "%d: %s\n" i (p |> packet_to_string "\n\t|");
+        aux (i+1) bits
     in
-    let e = endian_of hdr.magic in
-    aux e 0 pkts
-
+    aux 0 pkts
   with
       Unparsable (where, what) ->
         ep "EXC: %s\n" where;
         hexdump_bitstring stdout what
 
-let _ = main_dns_direct ()
 let _ = main_pcap ()
