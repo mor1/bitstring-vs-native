@@ -20,3 +20,5 @@ dns_bs.native: dns_bs.ml
 		-ocamlopt 'ocamlopt -I +site-lib/bitstring'\
 		-pp 'camlp4of -I /usr/local/lib/ocaml/site-lib/bitstring bitstring.cma bitstring_persistent.cma pa_bitstring.cmo' -Is site-lib/bitstring -libs unix,bitstring $@
 
+
+# camlp4of -I /usr/local/lib/ocaml/site-lib/bitstring bitstring.cma bitstring_persistent.cma pa_bitstring.cmo -printer o dns_bs.ml  > dns_bs.p.ml 

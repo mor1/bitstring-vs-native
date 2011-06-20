@@ -514,6 +514,7 @@ type eth = {
   smac: eaddr;
   etype: int16;
 }
+
 let eaddr_to_string e = 
   sp "%02x-%02x-%02x-%02x-%02x-%02x" 
     (int_of_byte e.[0]) (int_of_byte e.[1]) (int_of_byte e.[2])
@@ -673,13 +674,13 @@ let main_pcap () =
   let bits = bitstring_of_file fn in
   try
     let hdr, pkts = parse_pcap_file bits in
-    pr "PCAP FILE: %s\n" (pcap_file_to_string hdr);
+    (* pr "PCAP FILE: %s\n" (pcap_file_to_string hdr); *)
 
     let e = endian_of hdr.magic in
     let rec aux i bits = 
       if bitstring_length bits != 0 then
         let p, bits = pcap_demux e bits in
-        pr "%d: %s\n" i (p |> packet_to_string "\n\t|");
+        ignore(p); (* pr "%d: %s\n" i (p |> packet_to_string "\n\t|"); *)
         aux (i+1) bits
     in
     aux 0 pkts

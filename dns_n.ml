@@ -29,11 +29,45 @@
 let sp = Printf.sprintf
 let pr = Printf.printf
 let ep = Printf.eprintf
-let int_of_byte b = int_of_char b
+let (|>) x f = f x (* pipe *)
+let (>>) f g x = g (f x) (* functor pipe *)
+let (||>) l f = List.map f l (* element-wise pipe *)
+
+let (&&&) x y = Int32.logand x y
+let (|||) x y = Int32.logor x y
+let (^^^) x y = Int32.logxor x y
+let (<<<) x y = Int32.shift_left x y
+let (>>>) x y = Int32.shift_right_logical x y
+
+let int32_of_byte b = b |> int_of_char |> Int32.of_int
+let join c l = List.fold_left (fun x y -> y ^ c ^ x) "" l
+let ipv4_addr_of_bytes bs = 
+  ((bs.[0] |> int32_of_byte <<< 24) ||| (bs.[1] |> int32_of_byte <<< 16) 
+    ||| (bs.[2] |> int32_of_byte <<< 8) ||| (bs.[3] |> int32_of_byte))
+
+let ipv4_addr_to_string i = 
+  sp "%ld.%ld.%ld.%ld" 
+    ((i &&& 0x0_ff000000_l) >>> 24)
+    ((i &&& 0x0_00ff0000_l) >>> 16)
+    ((i &&& 0x0_0000ff00_l) >>>  8)
+    ((i &&& 0x0_000000ff_l)       )
+
+let bytes_to_string bs =
+  let l = String.length bs in
+  let str = String.make l ' ' in
+  let i = ref 0 in
+  while !i < l do
+    let b = bs.[!i] in
+    let s = sp "%c" b in
+    str.[!i] <- s.[0];
+    i := succ !i
+  done;
+  str
 
 type int16  = int
 type byte   = int
 type bytes  = string
+exception Unparsable of string * bytes
 
 type label        = bytes
 type domain_name  = bytes
@@ -121,28 +155,31 @@ let byte : byte Parser.t = Parser.(fmap int_of_char next)
 
 let bytes cnt : bytes Parser.t = Parser.take cnt
 
-let int16 : int16 Parser.t = 
+let int16h : int16 Parser.t = 
   Parser.(
     byte >>= fun lo ->
     byte >>= fun hi ->
     return ((hi lsl 8) lor lo)
   )
-(*
-let int32 : int32 Parser.t =
+let int16 : int16 Parser.t = 
   Parser.(
-    let (<|) m n = Int32.logor (Int32.shift_left m 8) (Int32.of_int n) in
-    byte >>= fun b0 ->
-    byte >>= fun b1 ->
-    byte >>= fun b2 ->
-    byte >>= fun b3 ->
-    return (((Int32.of_int b0 <| b1) <| b2) <| b3)
+    byte >>= fun hi ->
+    byte >>= fun lo ->
+    return ((hi lsl 8) lor lo)
   )
-  *)
+
+let int32h : int32 Parser.t = 
+  Parser.(
+    int16h >>= fun lo ->
+    int16h >>= fun hi ->
+    return (Int32.of_int ((hi lsl 16) lor  lo))
+  )
+
 let int32 : int32 Parser.t = 
   Parser.(
-    int16 >>= fun lo ->
     int16 >>= fun hi ->
-    return (Int32.of_int ((hi lsl 8) lor lo))
+    int16 >>= fun lo ->
+    return (Int32.of_int ((hi lsl 16) lor  lo))
   )
 
 (* Parsers are monadic, pretty-printers are monoidal *)
@@ -177,9 +214,9 @@ module Writer = struct
 
   let bytes (s : bytes) = Writer (fun buf -> Buffer.add_string buf s)
 
-  let int16 (n : int16) = Writer (fun buf ->
-    Buffer.add_char buf (char_of_int ((n lsr  8) land 255));
-    Buffer.add_char buf (char_of_int ( n         land 255)) )
+  let int16 (n : int) = Writer (fun buf ->
+    Buffer.add_char buf (char_of_int ( ((n lsr 8) land 255)));
+    Buffer.add_char buf (char_of_int (( n        land 255)) ))
 
   let int32 (n : int32) = Writer (fun buf ->
     Buffer.add_char buf (char_of_int (Int32.to_int (Int32.logand (Int32.shift_right n 24) 255l)));
@@ -202,14 +239,15 @@ let write_label (lbl : label) =
 
 let parse_label : label Parser.t =
   Parser.(
-    ensure (byte >>= fun n -> guard (0 < n && n < 64)) >> byte >>= bytes
+    ensure (byte >>= fun n -> guard (0 < n && n < 64))
+    >> byte >>= bytes
   )
 
 let write_domain_name (name : domain_name) =
   let labels = split_domain name in
   Writer.(sequence write_label labels ++ byte 0)
 
-let parse_domain_name : domain_name Parser.t =
+let parse_domain_name base : domain_name Parser.t =
   Parser.(
     let rec labels () =
       sequence parse_label       >>= fun ls  ->
@@ -218,12 +256,14 @@ let parse_domain_name : domain_name Parser.t =
         guard (n land 0xc0 = 0xc0) >>
           byte                   >>= fun m   ->
       let off = ((n land 0x3f) lsl 8) lor m in
+      let off = off+base in
       tell                       >>= fun pos ->
       seek off                   >>
         labels ()                >>= fun ls' ->
       seek pos                   >>
         return (ls @ ls')
-    in fmap (String.concat ".") $ labels ()
+    in 
+    fmap (String.concat ".") $ labels ()
   )
    
 type rr_type = [
@@ -349,12 +389,12 @@ let write_resource =
     | `Address addr ->
       int32  (Obj.magic addr : int32)
     | `Services (addr, proto, bmap) ->
-      int32             addr
+      int32                addr
       ++ byte              proto
       ++ bytes             bmap
   )
 
-let parse_resource rr_type rr_dlen =
+let parse_resource base rr_type rr_dlen =
   Parser.(match rr_type with
     | `HINFO ->
       parse_bytes                >>= fun cpu ->
@@ -362,15 +402,15 @@ let parse_resource rr_type rr_dlen =
       return (`Hostinfo (cpu, os))
     | `MB | `MD | `MF | `MG | `MR | `NS
     | `CNAME | `PTR ->
-      parse_domain_name          >>= fun name ->
+      parse_domain_name base          >>= fun name ->
       return (`Domain name)
     | `MINFO ->
-      parse_domain_name          >>= fun rmailbx ->
-      parse_domain_name          >>= fun emailbx ->
+      parse_domain_name base          >>= fun rmailbx ->
+      parse_domain_name base          >>= fun emailbx ->
       return (`Mailbox (rmailbx, emailbx))
     | `MX ->
       int16                      >>= fun preference ->
-      parse_domain_name          >>= fun exchange   ->
+      parse_domain_name base          >>= fun exchange   ->
       return (`Exchange (preference, exchange))
     | `NULL ->
       bytes rr_dlen              >>= fun data ->
@@ -379,8 +419,8 @@ let parse_resource rr_type rr_dlen =
       sequence (byte >>= bytes)  >>= fun texts ->
       return (`Text texts)
     | `SOA ->
-      parse_domain_name          >>= fun mname   ->
-      parse_domain_name          >>= fun rname   ->
+      parse_domain_name base          >>= fun mname   ->
+      parse_domain_name base          >>= fun rname   ->
       int32                      >>= fun serial  ->
       int32                      >>= fun refresh ->
       int32                      >>= fun retry   ->
@@ -416,16 +456,31 @@ let write_rsrc_record r =
     ++ bytes                    rr_rdata
   )
 
-let parse_rsrc_record =
+let parse_rsrc_record base =
   Parser.(
-    parse_domain_name              >>= fun rr_name  ->
+    parse_domain_name base              >>= fun rr_name  ->
     fmap rr_type_of_int  int16     >>= fun rr_type  ->
     fmap rr_class_of_int int16     >>= fun rr_class ->
     int32                          >>= fun rr_ttl   ->
     int16                          >>= fun rr_dlen  ->
-    parse_resource rr_type rr_dlen >>= fun rr_rdata ->
+    parse_resource base rr_type rr_dlen >>= fun rr_rdata ->
     return { rr_name; rr_type; rr_class; rr_ttl; rr_rdata; }
   )
+let string_of_resource r = 
+  match r with
+    | `Hostinfo (cpu, os) -> sp "Hostinfo (%s, %s)" cpu os
+    | `Domain n -> sp "Domain (%s)" n
+    | `Mailbox (rn, mn) -> sp "Mailbox (%s, %s)" rn mn
+    | `Exchange (i, n) -> sp "Exchange (%d, %s)" i n
+    | `Data d -> sp "Data (%s)" d
+    | `Text ns -> sp "Text (%s)" (ns |> join "|")
+    | `Authority (mn, rn, serial, refresh, retry, expire, min) 
+      -> (sp "Authority (%s, %s, %ld,%ld,%ld,%ld,%ld)" 
+            mn rn serial refresh retry expire min)
+    | `Address a -> sp "Address (%s)" (Unix.string_of_inet_addr a)
+    | `Services (a, p, bm) 
+      -> (sp "Services (%s, %d, %s)"
+            (ipv4_addr_to_string a) ( p) (bytes_to_string bm))
 
 type question = {
   q_name  : domain_name;
@@ -440,68 +495,112 @@ let write_question q =
     ++ int16 (int_of_q_class q.q_class)
   )
 
-let parse_question =
+let int_of_rr_class : rr_class -> int = function
+  | `IN -> 1
+  | `CS -> 2
+  | `CH -> 3
+  | `HS -> 4
+and string_of_rr_class : rr_class -> string = function
+  | `IN -> "IN"
+  | `CS -> "CS"
+  | `CH -> "CH"
+  | `HS -> "HS"
+and rr_class_of_int : int -> rr_class = function
+  | 1   -> `IN
+  | 2   -> `CS
+  | 3   -> `CH
+  | 4   -> `HS
+  | _   -> invalid_arg "rr_class_of_int"
+
+let parse_question base =
   Parser.(
-    parse_domain_name         >>= fun q_name  ->
+    parse_domain_name base        >>= fun q_name  ->
     fmap q_type_of_int  int16 >>= fun q_type  ->
     fmap q_class_of_int int16 >>= fun q_class ->
     return { q_name; q_type; q_class; }
   )
 
-type eaddr = string
-type eth = {
-  dmac: eaddr;
-  smac: eaddr;
-  etype: int16;
-}
+let int_of_q_class : q_class -> int = function
+  | `ANY           -> 255
+  | #rr_class as c -> int_of_rr_class c
+and string_of_q_class : q_class -> string = function
+  | `ANY           -> "ANY"
+  | #rr_class as c -> string_of_rr_class c
+and q_class_of_int : int -> q_class = function
+  | 255            -> `ANY
+  | n              -> (rr_class_of_int n :> q_class)
 
-let parse_eth = 
-  Parser.(
-    bytes 6 >>= fun dmac ->
-    bytes 6 >>= fun smac ->
-    int16   >>= fun etype ->
-    return { dmac; smac; etype }
-  )    
+let int_of_rr_type : rr_type -> int = function
+  | `A     ->  1
+  | `NS    ->  2
+  | `MD    ->  3
+  | `MF    ->  4
+  | `CNAME ->  5
+  | `SOA   ->  6
+  | `MB    ->  7
+  | `MG    ->  8
+  | `MR    ->  9
+  | `NULL  -> 10
+  | `WKS   -> 11
+  | `PTR   -> 12
+  | `HINFO -> 13
+  | `MINFO -> 14
+  | `MX    -> 15
+  | `TXT   -> 16
+and string_of_rr_type:rr_type -> string = function
+  | `A     ->  "A"
+  | `NS    ->  "NS"
+  | `MD    ->  "MD"
+  | `MF    ->  "MF"
+  | `CNAME ->  "CNAME"
+  | `SOA   ->  "SOA"
+  | `MB    ->  "MB"
+  | `MG    ->  "MG"
+  | `MR    ->  "MR"
+  | `NULL  -> "NULL"
+  | `WKS   -> "WKS"
+  | `PTR   -> "PTR"
+  | `HINFO -> "HINFO"
+  | `MINFO -> "MINFO"
+  | `MX    -> "MX"
+  | `TXT   -> "TXT"
+and rr_type_of_int : int -> rr_type = function
+  |  1     -> `A
+  |  2     -> `NS
+  |  3     -> `MD
+  |  4     -> `MF
+  |  5     -> `CNAME
+  |  6     -> `SOA
+  |  7     -> `MB
+  |  8     -> `MG
+  |  9     -> `MR
+  | 10     -> `NULL
+  | 11     -> `WKS
+  | 12     -> `PTR
+  | 13     -> `HINFO
+  | 14     -> `MINFO
+  | 15     -> `MX
+  | 16     -> `TXT
+  | _      -> invalid_arg "rr_type_of_int"
 
-type pcap = {
-  ts_secs: int32;
-  ts_usecs: int32;
-  caplen: int32;
-  pktlen: int32;
-}
-
-let parse_pcap = 
-  Parser.(
-    int32 >>= fun ts_secs ->
-    int32 >>= fun ts_usecs ->
-    int32 >>= fun caplen ->
-    int32 >>= fun pktlen ->
-    return { ts_secs; ts_usecs; caplen; pktlen }
-  )
-
-type pcap_file = {
-  magic: int32;
-  major: int16; 
-  minor: int16;
-  tzone: int32;
-  snaplen: int32;
-  linktype: int32;
-}
-let pcap_file_to_string pf =
-  sp "(%08lx) %d.%d tzone:%ld snaplen:%ld linktype:%ld"
-    pf.magic pf.major pf.minor pf.tzone pf.snaplen pf.linktype
-
-let parse_pcap_file = 
-  Parser.(
-    int32 >>= fun magic ->
-    int16 >>= fun major ->
-    int16 >>= fun minor ->
-    int32 >>= fun tzone ->
-    int32 >>= fun _ ->
-    int32 >>= fun snaplen ->
-    int32 >>= fun linktype ->
-    return { magic; major; minor; tzone; snaplen; linktype }
-  )
+let int_of_q_type : q_type -> int = function
+  | `AXFR         -> 252
+  | `MAILB        -> 253
+  | `MAILA        -> 254
+  | `ANY          -> 255
+  | #rr_type as t -> int_of_rr_type t
+and string_of_q_type:q_type -> string = function
+  | `AXFR         -> "AXFR"
+  | `MAILB        -> "MAILB"
+  | `MAILA        -> "MAILA"
+  | `ANY          -> "ANY"
+  | #rr_type as t -> string_of_rr_type t
+and q_type_of_int : int -> q_type = function
+  | 252           -> `AXFR
+  | 253           -> `MAILB
+  | 254           -> `MAILA
+  | 255           -> `ANY
+  | n             -> (rr_type_of_int n :> q_type)
 
 type dns_record = {
   id         : int16;
@@ -511,6 +610,24 @@ type dns_record = {
   authority  : rsrc_record list;
   additional : rsrc_record list;
 }
+
+let question_to_string q = 
+  sp "%s <%s|%s>" 
+    q.q_name (string_of_q_type q.q_type) (string_of_q_class q.q_class)
+
+let rr_to_string rr = 
+  sp "%s <%s|%s|%ld> %s" 
+    rr.rr_name 
+    (string_of_rr_type rr.rr_type) (string_of_rr_class rr.rr_class) rr.rr_ttl
+    (string_of_resource rr.rr_rdata)
+
+let dns_to_string d = 
+  sp "%04x %04x <qs:%s> <an:%s> <au:%s> <ad:%s>"
+    d.id d.detail
+    (d.question ||> question_to_string |> join ",")
+    (d.answer ||> rr_to_string |> join ",")
+    (d.authority ||> rr_to_string |> join ",")
+    (d.additional ||> rr_to_string |> join ",")
 
 let write_dns_record d =
   Writer.(
@@ -528,24 +645,25 @@ let write_dns_record d =
 
 let parse_dns_record =
   Parser.(
+    tell >>= fun base -> 
     int16                            >>= fun id         ->
     int16                            >>= fun detail     ->
     int16                            >>= fun qdcount    ->
     int16                            >>= fun ancount    ->
     int16                            >>= fun nscount    ->
     int16                            >>= fun arcount    ->
-    repeat qdcount parse_question    >>= fun question   ->
-    repeat ancount parse_rsrc_record >>= fun answer     ->
-    repeat nscount parse_rsrc_record >>= fun authority  ->
-    repeat arcount parse_rsrc_record >>= fun additional ->
+    repeat qdcount (parse_question base)    >>= fun question   ->
+    repeat ancount (parse_rsrc_record base) >>= fun answer     ->
+    repeat nscount (parse_rsrc_record base) >>= fun authority  ->
+    repeat arcount (parse_rsrc_record base) >>= fun additional ->
     return { id; detail; question; answer; authority; additional; }
   )
 
 let query ?(q_type=`A) id q_name =
   if id land 0xffff <> id then invalid_arg "query" 
   else {
-    id;
-    detail     = 0b0_0000_0010_000_0000;
+    id = id;
+    detail     =  0b0_0000_0010_000_0000;
     question   = [ { q_name; q_type; q_class = `IN; } ];
     answer     = [];
     authority  = [];
@@ -600,96 +718,295 @@ let contents ic = (* from http://ocaml.tuxfamily.org/Reading_a_file *)
   (try aux() with End_of_file -> ());
   (Buffer.contents buf)
 
-let pcap_to_string p = 
-  Printf.sprintf "%ld.%06ld [%ld/%ld]" p.ts_secs p.ts_usecs p.caplen p.pktlen
+
+type udp = {
+  sport: int16;
+  dport: int16;
+  length: int16;
+  cksum: int16;
+}
+
+let udp_to_string u = 
+  sp "%d,%d" u.sport u.dport
+
+let parse_udp = 
+  Parser.(
+    int16 >>= fun sport ->
+    int16 >>= fun dport ->
+    int16 >>= fun length ->
+    int16 >>= fun cksum ->
+    return { sport; dport; length; cksum }
+  )
+
+
+let is_wellknown_port p  = ((    0 <= p) && (p <=  1023))
+let is_registered_port p = (( 1024 <= p) && (p <= 49151))
+let is_ephemeral_port p  = ((49152 <= p) && (p <= 65535)) 
+let svc_port p q = 
+  match p,q with
+    | p,_ when p |> is_wellknown_port -> Some p
+    | _,q when q |> is_wellknown_port -> Some q
+    
+    | p,_ when p |> is_registered_port -> Some p
+    | _,q when q |> is_registered_port -> Some q
+
+    | _ -> None
+      
+let port_dns = 53
+
+type ipv4 = {
+  version: int;
+  hdrlen: int;
+  tos: byte;
+  length: int16;
+  ident: int16;
+  flags: byte;
+  offset: int;
+  ttl: byte;
+  proto: byte;
+  cksum: int16;
+  saddr: int32;
+  daddr: int32;
+  options: bytes;
+}
+
+
+let ipv4_addr_to_string i = 
+  sp "%ld.%ld.%ld.%ld" 
+    ((i &&& 0x0_ff000000_l) >>> 24)
+    ((i &&& 0x0_00ff0000_l) >>> 16)
+    ((i &&& 0x0_0000ff00_l) >>>  8)
+    ((i &&& 0x0_000000ff_l)       )
+
+let ipv4_to_string ih = 
+  sp "%s > %s, (%d) [%d,%02x,%s]"
+    (ipv4_addr_to_string ih.saddr) (ipv4_addr_to_string ih.daddr)
+    ih.proto ih.length ih.flags ih.options
+
+let parse_ipv4 = 
+  Parser.(
+    byte  >>= fun verhlen ->
+    let version = ((verhlen land 0xf0) lsr 4) in
+    let hdrlen = verhlen land 0x0f in
+    byte  >>= fun tos     ->
+    int16 >>= fun length  ->
+    int16 >>= fun ident   ->
+    int16 >>= fun flagoff ->
+    byte  >>= fun ttl     ->
+    byte  >>= fun proto   ->
+    int16 >>= fun cksum   ->
+    int32 >>= fun saddr   ->
+    int32 >>= fun daddr   ->
+    bytes ((hdrlen-5) * 4) >>= fun options ->
+    return { version; hdrlen; tos; length; ident;
+             flags =  ((flagoff land 0xd0) lsr 13);
+             offset =  (flagoff land 0x1f);
+             ttl; proto; cksum; saddr; daddr; options;
+           }
+  )
+
+let proto_icmp =   1
+let proto_tcp  =   6
+let proto_udp  =  17
+
+
+type eaddr = string
 let eaddr_to_string e = 
   sp "%02x-%02x-%02x-%02x-%02x-%02x" 
-    (int_of_byte e.[0]) (int_of_byte e.[1]) (int_of_byte e.[2])
-    (int_of_byte e.[3]) (int_of_byte e.[4]) (int_of_byte e.[5])
+    (int_of_char e.[0]) (int_of_char e.[1]) (int_of_char e.[2])
+    (int_of_char e.[3]) (int_of_char e.[4]) (int_of_char e.[5])
+
+type eth = {
+  dmac: eaddr;
+  smac: eaddr;
+  etype: int16;
+}
+
+let eth_to_string e = 
+  sp "%s > %s (%04x)" (eaddr_to_string e.smac) (eaddr_to_string e.dmac) e.etype
+
+let parse_eth = 
+  Parser.(
+    bytes 6 >>= fun dmac ->
+    bytes 6 >>= fun smac ->
+    int16   >>= fun etype ->
+    return { dmac; smac; etype }
+  )    
+
+type pcap = {
+  ts_secs: int32;
+  ts_usecs: int32;
+  caplen: int32;
+  pktlen: int32;
+}
+
+let parse_pcap = 
+  Parser.(
+    int32h >>= fun ts_secs ->
+    int32h >>= fun ts_usecs ->
+    int32h >>= fun caplen ->
+    int32h >>= fun pktlen ->
+    return { ts_secs; ts_usecs; caplen; pktlen }
+  )
+
+let pcap_to_string p = 
+  Printf.sprintf "%ld.%06ld [%ld/%ld]" p.ts_secs p.ts_usecs p.caplen p.pktlen
+
 
 type packet =
 | PCAP of pcap * packet
 | ETH of eth * packet
-| UNK of int
-| EOF
+| IPv4 of ipv4 * packet
+| UDP of udp * packet
+| DNS of dns_record
+
+| RAW of int * int
+| EOP 
+
+let udp_demux bs cur = function
+  | port_dns 
+    -> (let h, (_,c) = Parser.run parse_dns_record bs cur in
+        match h with Some h -> DNS(h) | None -> failwith "dns-unknown"
+    )
+
+let ipv4_demux bs cur = function
+  | proto_udp -> let h, (_,c) = Parser.run parse_udp bs cur in
+                 (match h with
+                   | Some h 
+                     -> let svcp = match svc_port h.sport h.dport with
+                       | Some p -> p
+                       | None -> failwith "udp-port-unknown"
+                        in UDP(h, udp_demux bs c svcp)
+                   | None -> failwith "udp-unknown"
+                 )
+
+let eth_demux bs cur = function
+  | etype_ipv4 
+    -> (let h, (_,c) = Parser.run parse_ipv4 bs cur in
+        match h with
+          | Some h -> IPv4(h, ipv4_demux bs c h.proto)
+          | None -> failwith "ipv4-unknown"
+    )
+
+let pcap_demux bs cur = function
+  | 1_l -> let h, (_,c) = Parser.run parse_eth bs cur in
+           (match h with
+             | Some h -> ETH(h, eth_demux bs c h.etype)
+             | None   -> failwith "eth-unknown"
+           )
+  | _ -> failwith "pcap-unknown"
+
+
+type pcap_file = {
+  magic: int32;
+  major: int16; 
+  minor: int16;
+  tzone: int32;
+  snaplen: int32;
+  linktype: int32;
+}
+
+let parse_pcap_file = 
+  Parser.(
+    int32h >>= fun magic ->
+    int16h >>= fun major ->
+    int16h >>= fun minor ->
+    int32h >>= fun tzone ->
+    int32 >>= fun _ ->
+    int32h >>= fun snaplen ->
+    int32h >>= fun linktype ->
+    return { magic; major; minor; tzone; snaplen; linktype }
+  )
+
+let pcap_file_to_string pf =
+  sp "(%08lx) %d.%d tzone:%ld snaplen:%ld linktype:%ld"
+    pf.magic pf.major pf.minor pf.tzone pf.snaplen pf.linktype
+
+
+let packet_to_string p = 
+  let rec aux p s = 
+    match p with 
+      | PCAP (h, d) -> let ns = sp "%s|PCAP(%s)" s (pcap_to_string h) in
+                       aux d ns
+      | ETH (h, d) -> let ns = sp "%s|ETH(%s)" s (eth_to_string h) in
+                      aux d ns
+      | IPv4 (h, d) -> let ns = sp "%s|IPv4(%s)" s (ipv4_to_string h) in 
+                       aux d ns
+      | UDP (h, d) -> let ns = sp "%s|UDP(%s)" s (udp_to_string h) in
+                      aux d ns
+      | DNS d -> sp "%s|DNS(%s)" s (dns_to_string d)
+
+      | RAW (st, nd) -> sp "%s|RAW(%d -> %d)" s st nd
+      | EOP -> "."
+  in
+  aux p ""
 
 let main_pcap () =
   let ic = open_in Sys.argv.(1) in
   unwind ~protect:close_in (fun ic ->
     let bs = contents ic in
+    let fh, (_, pos) = Parser.run parse_pcap_file bs 0 in
+    let fh = match fh with Some h -> h | None -> failwith "bad pcap file" in
+    (* pr "PCAP FILE: %s\n" (pcap_file_to_string fh); *)
+                                               
+    let rec loop i c = 
+      let h, (_,p) = Parser.run parse_pcap bs c in
+      match h with
+        | Some h -> 
+          let np = p+(Int32.to_int h.caplen) in
+          let pkt = PCAP(h, (pcap_demux bs p fh.linktype)) in
+          ignore(pkt); (* pr "[%d] %s\n" i (packet_to_string pkt); *)
+          loop (i+1) np
+          
+        | None -> EOP, -1
+    in loop 0 pos
+  ) ic
 
-    let hdr, (_,pkts) = Parser.run parse_pcap_file bs 0 in
-    let hdr = (match hdr with
-      | Some hdr 
-        -> Printf.printf "%s\n" (pcap_file_to_string hdr); hdr
-      | None -> failwith "not a pcap file"
-    )
-    in
-    let rec loop i pos = 
-      pr "!!! %d\n" pos;
-      let h, (_,p) = Parser.run parse_pcap bs pos in
+    
+(*
+
+
       let packet, caplen = (match h with
         | Some h 
-          -> pr "[%d] %s\n" i (pcap_to_string h);
-            PCAP(h,
-                 match hdr.linktype with
-                   | 0x00000001_l (* ethernet *)
-                     -> let eh, (_,np) = Parser.run parse_eth bs p in
-                        match eh with
-                          | Some eh ->
-                            Printf.printf "\t%s > %s [%04x]\n" 
-                              (eaddr_to_string eh.smac)
-                              (eaddr_to_string eh.dmac)
-                              (eh.etype);
-                            ETH(eh, UNK(np))
-                          | None -> failwith "bad eth"
-            ), h.caplen
-        | None -> EOF, 0l
+          -> PCAP(h, 
+                  let parse_next = (pcap_demux hdr.linktype bs) in
+                  let nh, (_,np) = Parser.run parse_next bs p in
+                  match nh with
+                    | Some nh 
+                      -> ETH(nh, 
+                             UNK(np))
+                    | None -> failwith "bad eth"
+          ), (Int32.to_int h.caplen)
+            
+        | None -> EOP, 0l
       )
-      in loop (i+1) (pos+(Int32.to_int caplen)+16 (* pcap hdr size *))
+      in loop (i+1) (pos+16+caplen)
     in
     loop 0 pkts
   ) ic
+*)
 
-    (*
-      match eh.etype with
-      | 0x0800 (* ipv4 *)
-      -> let ih, np = Parser.run parse_ipv4
-    *)
+(*
+let main_original () =
+
+  let server, domain = "128.243.98.2", "google.com." in
+  let d = query_dns server (query ~q_type:`A 0 domain) in
+  let bs = Writer.run (write_dns_record d) in
+  let oc = open_out "dns.out" in
+  output_string oc bs; close_out oc
+*)
 
 (*
 let main_dns_direct () = 
-
-  (*** construct a dns response fragment
-       let server, domain = "128.243.98.2", "google.com." in
-       
-       let d = query_dns server (query ~q_type:`A 0 domain) in
-       let bs = Writer.run (write_dns_record d) in
-       let oc = open_out "dns.out" in
-       output_string oc bs; close_out oc
-  *)
   
   let ic = open_in "dns.2.dat" in
   unwind ~protect:close_in (fun ic ->
     let ds = contents ic in
-    let p = Parser.run in
-    (match p parse_dns_record ds with
-      | Some r -> print_endline "some"
-      | None -> print_endline "none"
+    Parser.(
+      match run parse_dns_record ds 0 with
+        | Some r, _ -> print_endline "some"
+        | None  , _ -> print_endline "none"
     )
   ) ic
 *)
-
 let _ = main_pcap ()
-
-(* Parser.run evaluates the thunk it's passed in arg1 with the 
-   cursor = (string * position) it's passed in arg2 *)
-
-(* we will evaluate the first to get the pcap file; it should return
-   not just the result (a pcap_file) but also the *remaining* bytes;
-   we can then do the demux outside the monad -- since the demux
-   occurs based on what we have, not what's coming -- and re-evaluate
-   Parser.run passing in parse_pcap and remaining bytes.  that will
-   give a pcap plus remaining bytes; again, demux (linktype=1 =>
-   ethernet), and pass parse_eth and remaning bytes to Parser.run *)
-
